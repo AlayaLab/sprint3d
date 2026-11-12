@@ -1,0 +1,54 @@
+# Coarse-shape student: one-step consistency distillation of Pixal3D's 512 shape flow.
+# Run:  torchrun --nnodes 4 --nproc_per_node 4 train/shape_consistency/train.py --config train/configs/coarse_shape_student.yaml
+# The values below are those of the released student (docs/TRAINING.md): 16 processes x 1 object per update,
+# 3,000 updates. Set the two paths marked "set me" first. Relative paths are resolved against this file's directory.
+
+model:
+  pixal3d: null                 # Pixal3D weights: local directory or Hugging Face repository id
+                                # (null: $FASTPIXAL3D_PIXAL3D, else TencentARC/Pixal3D at the pinned revision)
+  pixal3d_src: null             # Pixal3D source checkout (null: $FASTPIXAL3D_PIXAL3D_SRC, else third_party/Pixal3D)
+  student: coarse_shape
+  base_submodel: ckpts/slat_flow_img2shape_dit_1_3B_512_bf16
+  gradient_checkpointing: false
+
+lora:
+  rank: 256
+  alpha: 256.0
+  dropout: 0.0
+
+consistency:
+  num_timesteps: 50             # uniform time grid: t_n = 1 - n/50, target one step (0.02) cleaner
+  loss_weight: 80.0
+  anchor_steps: 12              # the teacher's sample per object: 12 guided Euler steps, rescale_t 3
+  anchor_rescale_t: 3.0
+  guidance_strength: 7.5        # Pixal3D's shape sampler guidance (teacher anchor and teacher step)
+  guidance_rescale: 0.5
+  guidance_interval: [0.6, 1.0]
+
+data:
+  conditioning: /path/to/cache/coarse_shape_conditioning_wild_5k    # set me (train/caches/shape_conditioning_wild.py)
+  objects: ../../data/lists/train_5k.csv                            # 5,243 objects; records exist for 4,995 of them
+  object_key: id
+  exclude: null
+  max_objects: null
+
+optim:
+  updates: 3000
+  lr: 2.0e-6                    # constant
+  betas: [0.0, 0.999]
+  weight_decay: 1.0e-3
+  grad_clip: 10.0               # global norm over the adapters
+  ema_decay: 0.99               # ramped: min(0.99, (1 + n) / (10 + n)); the released weights are the EMA
+  seed: 20260716                # data order, anchors, draws; also the adapter initialisation (see docs/TRAINING.md)
+
+output:
+  dir: /path/to/runs/coarse_shape_student                          # set me
+  checkpoint_every: 250
+  log_every: 1
+  resume: auto                  # auto: continue from the newest checkpoint in output.dir; none; or a path
+
+runtime:
+  device: cuda
+  tf32_override: false          # the original runs did not set TORCH_ALLOW_TF32_CUBLAS_OVERRIDE
+  threads: 4
+  max_minutes: null

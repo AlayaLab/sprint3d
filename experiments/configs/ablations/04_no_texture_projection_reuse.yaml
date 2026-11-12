@@ -1,0 +1,8 @@
+# Paper row: Texture projection reuse across steps
+# One-lever-off ablation (removed from Ours).
+# The per-block context projections of the texture flow are recomputed every step (the
+# structure student keeps its CUDA graph).
+name: no_texture_projection_reuse
+method: fast
+removes: [texture_projection_reuse]
+levers: {texture_projection_reuse: false}

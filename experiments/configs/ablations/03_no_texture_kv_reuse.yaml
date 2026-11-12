@@ -1,0 +1,7 @@
+# Paper row: Texture K/V reuse across steps
+# One-lever-off ablation (removed from Ours).
+# Keys, values and projected image features of the texture flow are recomputed every step.
+name: no_texture_kv_reuse
+method: fast
+removes: [texture_kv_reuse]
+levers: {texture_kv_reuse: false}

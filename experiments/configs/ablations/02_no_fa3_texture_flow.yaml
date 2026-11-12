@@ -1,0 +1,7 @@
+# Paper row: FlashAttention-3, texture flow
+# One-lever-off ablation (removed from Ours).
+# The texture flow runs on FlashAttention-2.
+name: no_fa3_texture_flow
+method: fast
+removes: [fa3_texture_flow]
+levers: {fa3_texture_flow: false}

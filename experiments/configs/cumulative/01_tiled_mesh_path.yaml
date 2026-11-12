@@ -1,0 +1,11 @@
+# Paper row: + tiled mesh path (16-tile atlas)
+# Cumulative measurement, row 01 of 00-18 (file order = order of the measurement); block: mesh
+# post-processing (rows 01-08).
+# This package with every lever off: Pixal3D's released 12-step flows in all four stages (no student) and
+# the tiled mesh path (gpu_chart_segmentation off): a host-built BVH (native/legacy) and 16 tiles unwrapped
+# by xatlas on a CPU thread pool while the texture flow samples. Rows 01-13 keep the released 12-step flows.
+name: tiled_mesh_path
+method: fast
+block: post_processing
+adds: []
+levers: []

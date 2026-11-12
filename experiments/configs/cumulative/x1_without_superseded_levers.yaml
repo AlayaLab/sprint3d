@@ -1,0 +1,12 @@
+# Paper row: (control) + single-pass GPU chart segmentation, without per-tile unwrapping and pinned BVH transfers
+# Cumulative measurement, control of row 08 (gpu_chart_segmentation); runs with the chain, not part of it.
+# Not a step of the chain. Row 08 without the two levers that act only on the tiled CPU unwrap, which row 08
+# replaces; row 08 minus this row is their effect in the final mesh path (a note to the report's cumulative
+# tables).
+name: without_superseded_levers
+method: fast
+control_of: gpu_chart_segmentation
+adds: []
+removes: [per_tile_single_thread_unwrap, pinned_bvh_transfers]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, adaptive_remesh,
+  lean_glb_writer, gpu_chart_segmentation]

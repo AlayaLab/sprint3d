@@ -1,0 +1,10 @@
+# Paper row: + faster GPU simplification and charting
+# Cumulative measurement, row 04 of 00-18 (file order = order of the measurement); block: mesh
+# post-processing (rows 01-08).
+# Patched CuMesh (native/): simplification and the GPU chart clustering of the tiled path run their round
+# loops on the device.
+name: fast_gpu_simplify
+method: fast
+block: post_processing
+adds: [fast_gpu_simplify]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify]

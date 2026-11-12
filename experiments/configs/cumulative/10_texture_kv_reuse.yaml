@@ -1,0 +1,10 @@
+# Paper row: + texture K/V reuse across steps
+# Cumulative measurement, row 10 of 00-18 (file order = order of the measurement); block: flow engineering
+# (rows 09-13).
+name: texture_kv_reuse
+method: fast
+block: flow_engineering
+adds: [texture_kv_reuse]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, adaptive_remesh,
+  lean_glb_writer, gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers,
+  fa3_texture_flow, texture_kv_reuse]

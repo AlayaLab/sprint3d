@@ -1,0 +1,6 @@
+# Paper row: None (Ours)
+# One-lever-off ablation (removed from Ours): the reference row, every lever on.
+name: ours
+method: fast
+removes: []
+levers: {}

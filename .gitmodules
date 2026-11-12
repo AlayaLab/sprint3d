@@ -1,0 +1,25 @@
+[submodule "Pixal3D"]
+	path = third_party/Pixal3D
+	url = https://github.com/TencentARC/Pixal3D.git
+[submodule "TRELLIS.2"]
+	path = third_party/TRELLIS.2
+	url = https://github.com/microsoft/TRELLIS.2.git
+[submodule "CuMesh"]
+	path = third_party/CuMesh
+	url = https://github.com/JeffreyXiang/CuMesh.git
+[submodule "cubvh"]
+	path = third_party/cubvh
+	url = https://github.com/JeffreyXiang/cubvh.git
+	branch = trellis.2
+[submodule "flash-attention"]
+	path = third_party/flash-attention
+	url = https://github.com/Dao-AILab/flash-attention.git
+[submodule "ULIP"]
+	path = third_party/ULIP
+	url = https://github.com/salesforce/ULIP.git
+[submodule "Uni3D"]
+	path = third_party/Uni3D
+	url = https://github.com/baaivision/Uni3D.git
+[submodule "TripoSG"]
+	path = third_party/TripoSG
+	url = https://github.com/VAST-AI-Research/TripoSG.git

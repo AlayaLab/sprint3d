@@ -1,0 +1,8 @@
+# Paper row: Mesh pre-processing on a worker thread
+# One-lever-off ablation (removed from Ours).
+# With the worker thread off, mesh cleaning, BVH, remeshing and simplification run on the main
+# thread before the texture is sampled; the GPU UV atlas still overlaps the texture flow.
+name: no_mesh_prep_worker_thread
+method: fast
+removes: [mesh_prep_worker_thread]
+levers: {mesh_prep_worker_thread: false}

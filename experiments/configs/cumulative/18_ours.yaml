@@ -1,0 +1,14 @@
+# Paper row: Ours (+ texture student: trajectory, 2 steps)
+# Cumulative measurement, row 18 of 00-18 (file order = order of the measurement); block: distilled students
+# (rows 14-18).
+# The deployed configuration: every lever on.
+name: ours
+method: fast
+block: distillation
+structure_adapter: structure
+adds: [texture_student]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, adaptive_remesh,
+  lean_glb_writer, gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers,
+  fa3_texture_flow, texture_kv_reuse, shared_conditioning, fa3_fine_shape_flow, texture_side_stream,
+  structure_student, texture_projection_reuse, coarse_shape_student, fine_shape_student, fold_lora_fine_shape,
+  texture_student]

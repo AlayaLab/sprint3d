@@ -1,0 +1,20 @@
+diff --git a/src/bindings.cpp b/src/bindings.cpp
+index 0485adc..019679c 100644
+--- a/src/bindings.cpp
++++ b/src/bindings.cpp
+@@ -16,10 +16,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+ // CUDA API
+ py::class_<cuBVH>(m, "cuBVH")
+     .def("ray_trace", &cuBVH::ray_trace)
+-    .def("unsigned_distance", &cuBVH::unsigned_distance)
++    // GIL released: pure CUDA work on already-converted at::Tensor arguments
++    .def("unsigned_distance", &cuBVH::unsigned_distance, py::call_guard<py::gil_scoped_release>())
+     .def("signed_distance", &cuBVH::signed_distance);
+ 
+-m.def("create_cuBVH", &create_cuBVH);
++// GIL released during the host-side BVH build: the Eigen refs alias caller-owned numpy
++// buffers that stay alive for the duration of the call; no Python API is touched inside.
++m.def("create_cuBVH", &create_cuBVH, py::call_guard<py::gil_scoped_release>());
+ 
+ m.def("floodfill", &floodfill);
+ 

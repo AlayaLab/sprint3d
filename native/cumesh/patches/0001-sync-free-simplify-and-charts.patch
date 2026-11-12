@@ -1,0 +1,3497 @@
+diff --git a/fastpixal3d_cumesh/cumesh.py b/fastpixal3d_cumesh/cumesh.py
+index c695324..a9b3500 100644
+--- a/fastpixal3d_cumesh/cumesh.py
++++ b/fastpixal3d_cumesh/cumesh.py
+@@ -52,6 +52,18 @@ class CuMesh:
+     def num_boundary_loops(self) -> int:
+         return self.cu_mesh.num_boundary_loops()
+ 
++    @property
++    def deterministic(self) -> bool:
++        """fastpixal3d_cumesh: opt-in deterministic mode (sorted vertex-face lists,
++        order-fixed chart length/perimeter sums) for BOTH the original and the
++        sync-free paths. Default False = pristine (not run-to-run repeatable)
++        behaviour. Set before init()/any computation."""
++        return self.cu_mesh.deterministic
++
++    @deterministic.setter
++    def deterministic(self, value: bool):
++        self.cu_mesh.deterministic = bool(value)
++
+     def clear_cache(self):
+         """
+         Clear the cached data.
+@@ -317,7 +329,9 @@ class CuMesh:
+         """
+         self.cu_mesh.unify_face_orientations()
+     
+-    def simplify(self, target_num_faces: int, verbose: bool=False, options: dict={}):
++    def simplify(self, target_num_faces: int, verbose: bool=False, options: dict={}, sync_free: bool=False, max_rounds: int=1000, sync_every: int=8,
++                 compact_edge_bits: bool=False, ratio_thresh: float=1e-2, escalation_factor: float=10.0,
++                 fuse_round_kernels: bool=False, use_cuda_graph: bool=False):
+         """
+         Simplifies the mesh using a fast approximation algorithm with gpu acceleration.
+ 
+@@ -325,39 +339,92 @@ class CuMesh:
+             target_num_faces: the target number of faces to simplify to.
+             verbose: whether to print the progress of the simplification.
+             options: a dictionary of options for the simplification algorithm.
++            sync_free: if True, run the whole round loop (threshold escalation
++                and the target-reached check) on the device via
++                CuMesh.simplify_sync_free() (src/simplify_fast.cu) instead of
++                one Python<->C++ simplify_step() call (with its own device
++                syncs, allocations and frees) per round. Produces the same
++                mesh as sync_free=False. Not compatible with verbose.
++            max_rounds: sync_free only -- hard cap on the number of rounds.
++                Rounds after convergence are device-side no-ops.
++            sync_every: sync_free only -- if > 0, the host polls the device
++                done flag every sync_every rounds and stops early (bounding
++                the wasted no-op rounds by sync_every-1 at the cost of one
++                host sync per sync_every rounds); 0 = never poll, run exactly
++                max_rounds rounds.
++            compact_edge_bits: sync_free only (fastpixal3d_cumesh) -- pack the
++                per-round edge sort key into 2*ceil(log2(V+1)) bits instead
++                of the fixed 64, cutting cub::DeviceRadixSort's pass count.
++                Same sort order / same selection as the default (False).
++            ratio_thresh: sync_free only (fastpixal3d_cumesh) -- the "<ratio_thresh
++                removed this round -> escalate threshold" cutoff (default
++                1e-2, matching sync_free=False's hardcoded
++                value).
++            escalation_factor: sync_free only (fastpixal3d_cumesh) -- the
++                threshold multiplier applied when ratio_thresh fires
++                (default 10.0, matching sync_free=False's
++                hardcoded value).
++            fuse_round_kernels: sync_free only (fastpixal3d_cumesh) -- merge the
++                per-round count-update and decision kernels into one launch
++                (pure launch-count reduction, does not change any value).
++            use_cuda_graph: sync_free only (fastpixal3d_cumesh) -- capture one
++                round's kernel sequence into a CUDA graph and replay it via
++                cudaGraphLaunch instead of issuing every kernel launch from
++                the host each round; falls back to the normal loop if
++                capture fails.
+         """
+         assert isinstance(target_num_faces, int) and target_num_faces > 0, "target_num_faces must be a positive integer"
+ 
+         num_face = self.cu_mesh.num_faces()
+         if num_face <= target_num_faces:
++            self.last_simplify_stats = {"rounds": 0, "done": True, "num_faces": num_face, "sync_free": sync_free}
+             return
+-        
+-        if verbose:
+-            pbar = tqdm(total=num_face-target_num_faces, desc="Simplifying", disable=not verbose)
+ 
+         thresh = options.get('thresh', 1e-8)
+         lambda_edge_length = options.get('lambda_edge_length', 1e-2)
+         lambda_skinny = options.get('lambda_skinny', 1e-3)
++
++        if sync_free:
++            assert not verbose, "simplify(sync_free=True) has no per-round host visibility to report progress with verbose=True"
++            new_num_vert, new_num_face, rounds, done = self.cu_mesh.simplify_sync_free(
++                lambda_edge_length, lambda_skinny, float(thresh), target_num_faces, max_rounds, sync_every,
++                compact_edge_bits, ratio_thresh, escalation_factor, fuse_round_kernels, use_cuda_graph
++            )
++            self.last_simplify_stats = {"rounds": rounds, "done": bool(done), "num_faces": new_num_face, "num_vertices": new_num_vert, "sync_free": True}
++            if not done:
++                import warnings
++                warnings.warn(
++                    f"simplify(sync_free=True): max_rounds={max_rounds} was reached before "
++                    f"target_num_faces={target_num_faces} could be reached (ended at "
++                    f"{new_num_face} faces); increase max_rounds for this mesh."
++                )
++            return
++
++        if verbose:
++            pbar = tqdm(total=num_face-target_num_faces, desc="Simplifying", disable=not verbose)
++
++        rounds = 0
+         while True:
+             if verbose:
+                 pbar.set_description(f"Simplifying [thres={thresh:.2e}]")
+-            
++
+             new_num_vert, new_num_face = self.cu_mesh.simplify_step(lambda_edge_length, lambda_skinny, thresh, False)
+-            
++            rounds += 1
++
+             if verbose:
+                 pbar.update(num_face - max(target_num_faces, new_num_face))
+ 
+             if new_num_face <= target_num_faces:
+                 break
+-            
++
+             del_num_face = num_face - new_num_face
+             if del_num_face / num_face < 1e-2:
+                 thresh *= 10
+             num_face = new_num_face
+-            
++
+         if verbose:
+             pbar.close()
+-            
++        self.last_simplify_stats = {"rounds": rounds, "done": True, "num_faces": new_num_face, "num_vertices": new_num_vert, "sync_free": False}
+     def compute_charts(
+         self,
+         threshold_cone_half_angle_rad: float=math.radians(90),
+@@ -366,6 +433,14 @@ class CuMesh:
+         smooth_strength: float=1,
+         area_penalty_weight: float=0.1,
+         perimeter_area_ratio_weight: float=0.0001,
++        sync_free: bool=False,
++        max_rounds: int=4096,
++        sync_every: int=4,
++        max_uf_passes: int=64,
++        fallback_on_cap: bool=True,
++        compact_chart_bits: bool=False,
++        skip_collapse_cone_writeback: bool=False,
++        fuse_round_kernels: bool=False,
+     ):
+         """
+         Compute the atlas charts.
+@@ -375,12 +450,84 @@ class CuMesh:
+             refine_iterations: The number of refinement iterations.
+             smooth_strength: The strength of chart boundary smoothing.
+             area_penalty_weight: Coefficient for chart size penalty. Cost += Area * weight.
+-                                 Prevents charts from becoming too large if > 0, 
++                                 Prevents charts from becoming too large if > 0,
+                                  or encourages larger charts if < 0 (though usually used to penalize size variance).
+-            perimeter_area_ratio_weight: Coefficient for shape irregularity (long-strip) penalty. 
++            perimeter_area_ratio_weight: Coefficient for shape irregularity (long-strip) penalty.
+                                          Cost += (Perimeter / Area) * weight.
+                                          Higher values penalize long strips and encourage circular/compact shapes.
+-        """
++            sync_free: if True, use CuMesh.compute_charts_sync_free()
++                (src/atlas_fast.cu): the same algorithm with every per-round
++                host decision moved to the device (see that file's header),
++                so the whole global/collapse/refine/reassign loop nest is
++                enqueued without per-round host syncs, allocations or frees.
++                Results are identical to sync_free=False.
++            max_rounds: sync_free only -- cap on collapse rounds per global
++                iteration (rounds after convergence are device-side no-ops;
++                with sync_every > 0 at most sync_every-1 of them run). Real
++                meshes need hundreds of rounds (measured: 363 on a 197k-face
++                simplified mesh, >512 on its 5.5M-face source), hence the
++                generous default.
++            sync_every: sync_free only -- host poll period (in rounds) for the
++                collapse loop's device done flag; 0 = never poll (run exactly
++                max_rounds rounds per global iteration).
++            max_uf_passes: sync_free only -- cap on union-find passes in the
++                chart reassignment step (passes after convergence are no-ops).
++            fallback_on_cap: sync_free only -- if a cap is hit before
++                convergence (a RuntimeError from the C++ side), warn and rerun
++                with the original compute_charts() instead of raising.
++            compact_chart_bits: sync_free only (fastpixal3d_cumesh) -- pack the
++                per-round chart_adj sort key into 2*ceil(log2(C+1)) bits
++                instead of the fixed 64 (disabled whenever
++                CuMesh.deterministic is set); also narrows the two plain-int
++                sorts unconditionally. Same selection as the default (False).
++            skip_collapse_cone_writeback: sync_free only (fastpixal3d_cumesh) --
++                skip the per-collapse chart-cone merge computation, which is
++                always overwritten before being read (see src/atlas_fast.cu
++                header "CO2") -- does not change any computed value.
++            fuse_round_kernels: sync_free only (fastpixal3d_cumesh) -- merge two
++                independent same-round kernel pairs (disjoint arrays) into
++                one launch each -- pure launch-count reduction.
++        """
++        if sync_free:
++            try:
++                stats = self.cu_mesh.compute_charts_sync_free(
++                    threshold_cone_half_angle_rad,
++                    refine_iterations,
++                    global_iterations,
++                    smooth_strength,
++                    area_penalty_weight,
++                    perimeter_area_ratio_weight,
++                    max_rounds,
++                    sync_every,
++                    max_uf_passes,
++                    compact_chart_bits,
++                    skip_collapse_cone_writeback,
++                    fuse_round_kernels,
++                )
++            except RuntimeError as e:
++                if fallback_on_cap and ("max_rounds" in str(e) or "max_uf_passes" in str(e)):
++                    import warnings
++                    warnings.warn(f"compute_charts(sync_free=True) hit a cap; falling back to the original path: {e}")
++                    self.last_charts_stats = None
++                    self.cu_mesh.compute_charts(
++                        threshold_cone_half_angle_rad,
++                        refine_iterations,
++                        global_iterations,
++                        smooth_strength,
++                        area_penalty_weight,
++                        perimeter_area_ratio_weight
++                    )
++                    return
++                raise
++            per_iter = [stats[4 * i: 4 * i + 4] for i in range(global_iterations)]
++            self.last_charts_stats = {
++                "collapse_rounds": [p[0] for p in per_iter],
++                "collapse_converged": [bool(p[1]) for p in per_iter],
++                "uf_passes": [p[2] for p in per_iter],
++                "uf_converged": [bool(p[3]) for p in per_iter],
++                "sync_free": True,
++            }
++            return
+         self.cu_mesh.compute_charts(
+             threshold_cone_half_angle_rad,
+             refine_iterations,
+@@ -389,7 +536,7 @@ class CuMesh:
+             area_penalty_weight,
+             perimeter_area_ratio_weight
+         )
+-        
++        self.last_charts_stats = {"sync_free": False, "collapse_rounds": list(self.cu_mesh.last_charts_rounds)}
+     def read_atlas_charts(self) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         """
+         Read the atlas chart IDs for each face.
+diff --git a/setup.py b/setup.py
+index 12e6c47..3f69cc1 100644
+--- a/setup.py
++++ b/setup.py
+@@ -79,12 +79,14 @@ ext_modules = [
+             "src/hash/hash.cu",
+ 
+             "src/atlas.cu",
++            "src/atlas_fast.cu",
+             "src/clean_up.cu",
+             "src/cumesh.cu",
+             "src/connectivity.cu",
+             "src/geometry.cu",
+             "src/io.cu",
+             "src/simplify.cu",
++            "src/simplify_fast.cu",
+             "src/shared.cu",
+ 
+             "src/remesh/simple_dual_contour.cu",
+diff --git a/src/atlas.cu b/src/atlas.cu
+index 4c12e58..f80e8b0 100644
+--- a/src/atlas.cu
++++ b/src/atlas.cu
+@@ -1,6 +1,7 @@
+ #include "cumesh.h"
+ #include "dtypes.cuh"
+ #include "shared.h"
++#include "atlas_det.cuh"
+ #include <cub/cub.cuh>
+ #include <c10/cuda/CUDAStream.h>
+ 
+@@ -277,10 +278,175 @@ static __global__ void collapse_edges_kernel(
+ }
+ 
+ 
++// fastpixal3d_cumesh DETERMINISTIC MODE variant of get_chart_connectivity (used
++// when mesh.deterministic is set; see atlas_det.cuh for what D1-D3 replace).
++// Host-synced exactly like the original; shares its kernels with the
++// sync-free path (atlas_fast.cu) so both compute bit-identical values.
++static void get_chart_connectivity_det(
++    CuMesh& mesh,
++    cudaStream_t stream
++) {
++    size_t M = mesh.manifold_face_adj.size;
++
++    mesh.atlas_chart_adj.resize(M);
++    mesh.atlas_chart_adj_length.resize(M);
++    float *cu_raw_lengths, *cu_sorted_lengths;
++    int *cu_flags, *cu_run_index, *cu_run_offsets, *cu_num_runs;
++    CUDA_CHECK(cudaMalloc(&cu_raw_lengths, M * sizeof(float)));
++    CUDA_CHECK(cudaMalloc(&cu_sorted_lengths, M * sizeof(float)));
++    CUDA_CHECK(cudaMalloc(&cu_flags, M * sizeof(int)));
++    CUDA_CHECK(cudaMalloc(&cu_run_index, M * sizeof(int)));
++    CUDA_CHECK(cudaMalloc(&cu_run_offsets, (M + 1) * sizeof(int)));
++    CUDA_CHECK(cudaMalloc(&cu_num_runs, sizeof(int)));
++
++    init_chart_adj_kernel<<<(M + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
++        mesh.vertices.ptr,
++        mesh.faces.ptr,
++        mesh.manifold_face_adj.ptr,
++        mesh.atlas_chart_ids.ptr,
++        M,
++        mesh.atlas_chart_adj.ptr,
++        cu_raw_lengths
++    );
++    CUDA_CHECK(cudaGetLastError());
++
++    size_t temp_storage_bytes = 0;
++    mesh.temp_storage.resize(M * sizeof(uint64_t));
++    uint64_t* cu_sorted_keys = reinterpret_cast<uint64_t*>(mesh.temp_storage.ptr);
++    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        nullptr, temp_storage_bytes,
++        mesh.atlas_chart_adj.ptr, cu_sorted_keys,
++        cu_raw_lengths, cu_sorted_lengths,
++        M, 0, sizeof(uint64_t) * 8, stream
++    ));
++    mesh.cub_temp_storage.resize(temp_storage_bytes);
++    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        mesh.cub_temp_storage.ptr, temp_storage_bytes,
++        mesh.atlas_chart_adj.ptr, cu_sorted_keys,
++        cu_raw_lengths, cu_sorted_lengths,
++        M, 0, sizeof(uint64_t) * 8, stream
++    ));
++
++    // D1: runs of equal keys (integer ops only), then segmented float sums
++    det_run_flags_kernel<<<(M + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_sorted_keys, M, cu_flags);
++    CUDA_CHECK(cudaGetLastError());
++    temp_storage_bytes = 0;
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, temp_storage_bytes, cu_flags, cu_run_index, M, stream));
++    mesh.cub_temp_storage.resize(temp_storage_bytes);
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(mesh.cub_temp_storage.ptr, temp_storage_bytes, cu_flags, cu_run_index, M, stream));
++    det_scatter_runs_kernel<<<(M + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
++        cu_sorted_keys, cu_flags, cu_run_index, M, mesh.atlas_chart_adj.ptr, cu_run_offsets, cu_num_runs);
++    CUDA_CHECK(cudaGetLastError());
++    int num_runs = 0;
++    CUDA_CHECK(cudaMemcpyAsync(&num_runs, cu_num_runs, sizeof(int), cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    temp_storage_bytes = 0;
++    CUDA_CHECK(cub::DeviceSegmentedReduce::Sum(
++        nullptr, temp_storage_bytes,
++        cu_sorted_lengths, mesh.atlas_chart_adj_length.ptr,
++        num_runs, cu_run_offsets, cu_run_offsets + 1, stream
++    ));
++    mesh.cub_temp_storage.resize(temp_storage_bytes);
++    CUDA_CHECK(cub::DeviceSegmentedReduce::Sum(
++        mesh.cub_temp_storage.ptr, temp_storage_bytes,
++        cu_sorted_lengths, mesh.atlas_chart_adj_length.ptr,
++        num_runs, cu_run_offsets, cu_run_offsets + 1, stream
++    ));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    mesh.atlas_chart_adj.size = num_runs;
++    mesh.atlas_chart_adj_length.size = num_runs;
++    CUDA_CHECK(cudaFree(cu_raw_lengths));
++    CUDA_CHECK(cudaFree(cu_sorted_lengths));
++    CUDA_CHECK(cudaFree(cu_flags));
++    CUDA_CHECK(cudaFree(cu_run_index));
++    CUDA_CHECK(cudaFree(cu_run_offsets));
++    CUDA_CHECK(cudaFree(cu_num_runs));
++    // Remove invalid edge (UINT64_MAX) if present (sorted: it is last).
++    uint64_t last_key;
++    if (mesh.atlas_chart_adj.size > 0) {
++        CUDA_CHECK(cudaMemcpyAsync(&last_key, mesh.atlas_chart_adj.ptr + mesh.atlas_chart_adj.size - 1, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        if (last_key == UINT64_MAX) {
++            mesh.atlas_chart_adj.size -= 1;
++            mesh.atlas_chart_adj_length.size -= 1;
++        }
++    }
++    if (mesh.atlas_chart_adj.size == 0) {
++        return;
++    }
++
++    // 2. Chart-edge connectivity (counts as the original; the cnt buffer is
++    // C+1 long here so the C+1-wide ExclusiveSum below stays in bounds)
++    size_t E = mesh.atlas_chart_adj.size;
++    size_t C = mesh.atlas_num_charts;
++    mesh.atlas_chart2edge_cnt.resize(C + 1);
++    mesh.atlas_chart2edge_cnt.zero();
++    mesh.atlas_chart_perims.resize(C);
++    mesh.atlas_chart_perims.zero();
++    get_chart_edge_cnt_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
++        mesh.atlas_chart_adj.ptr,
++        mesh.atlas_chart_adj_length.ptr,
++        E,
++        mesh.atlas_chart2edge_cnt.ptr,
++        mesh.atlas_chart_perims.ptr
++    );
++    CUDA_CHECK(cudaGetLastError());
++    mesh.atlas_chart2edge_offset.resize(C + 1);
++    temp_storage_bytes = 0;
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
++        nullptr, temp_storage_bytes,
++        mesh.atlas_chart2edge_cnt.ptr,
++        mesh.atlas_chart2edge_offset.ptr,
++        C + 1, stream
++    ));
++    mesh.cub_temp_storage.resize(temp_storage_bytes);
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
++        mesh.cub_temp_storage.ptr, temp_storage_bytes,
++        mesh.atlas_chart2edge_cnt.ptr,
++        mesh.atlas_chart2edge_offset.ptr,
++        C + 1, stream
++    ));
++    // D3: sorted per-chart edge lists via a stable radix sort of (chart, edge)
++    mesh.atlas_chart2edge.resize(2 * E);
++    int *cu_keys2, *cu_sorted_keys2, *cu_vals2;
++    CUDA_CHECK(cudaMalloc(&cu_keys2, 2 * E * sizeof(int)));
++    CUDA_CHECK(cudaMalloc(&cu_sorted_keys2, 2 * E * sizeof(int)));
++    CUDA_CHECK(cudaMalloc(&cu_vals2, 2 * E * sizeof(int)));
++    det_expand_chart_keys_kernel<<<(E + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
++        mesh.atlas_chart_adj.ptr, nullptr, E, nullptr, cu_keys2, cu_vals2);
++    CUDA_CHECK(cudaGetLastError());
++    temp_storage_bytes = 0;
++    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        nullptr, temp_storage_bytes,
++        cu_keys2, cu_sorted_keys2, cu_vals2, mesh.atlas_chart2edge.ptr,
++        2 * E, 0, sizeof(int) * 8, stream
++    ));
++    mesh.cub_temp_storage.resize(temp_storage_bytes);
++    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        mesh.cub_temp_storage.ptr, temp_storage_bytes,
++        cu_keys2, cu_sorted_keys2, cu_vals2, mesh.atlas_chart2edge.ptr,
++        2 * E, 0, sizeof(int) * 8, stream
++    ));
++    // D2: sequential perimeters over the sorted lists (overwrites the atomic sums)
++    det_chart_perim_kernel<<<(C + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
++        mesh.atlas_chart2edge.ptr, mesh.atlas_chart2edge_offset.ptr, mesh.atlas_chart_adj_length.ptr,
++        nullptr, C, nullptr, mesh.atlas_chart_perims.ptr);
++    CUDA_CHECK(cudaGetLastError());
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaFree(cu_keys2));
++    CUDA_CHECK(cudaFree(cu_sorted_keys2));
++    CUDA_CHECK(cudaFree(cu_vals2));
++}
++
++
+ static void get_chart_connectivity(
+     CuMesh& mesh,
+     cudaStream_t stream
+ ) {
++    if (mesh.deterministic) {
++        get_chart_connectivity_det(mesh, stream);
++        return;
++    }
+     size_t M = mesh.manifold_face_adj.size;
+ 
+     // 1. Get chart adjacency
+@@ -1101,8 +1267,11 @@ void CuMesh::compute_charts(
+     // Main Iteration: Collapse and Refine
+     int* cu_end_flag; int h_end_flag;
+     CUDA_CHECK(cudaMalloc(&cu_end_flag, sizeof(int)));
++    this->last_charts_rounds.clear();
+     for (int i = 0; i < global_iterations; i++) {
++        this->last_charts_rounds.push_back(0);
+         while (true) {
++            this->last_charts_rounds.back() += 1;  // fastpixal3d_cumesh instrumentation (no effect on results)
+             h_end_flag = 1;
+             CUDA_CHECK(cudaMemcpyAsync(cu_end_flag, &h_end_flag, sizeof(int), cudaMemcpyHostToDevice, stream));
+             CUDA_CHECK(cudaStreamSynchronize(stream));
+diff --git a/src/atlas_det.cuh b/src/atlas_det.cuh
+new file mode 100644
+index 0000000..c459617
+--- /dev/null
++++ b/src/atlas_det.cuh
+@@ -0,0 +1,111 @@
++// atlas_det.cuh -- kernels for the opt-in DETERMINISTIC chart-connectivity
++// mode (CuMesh::deterministic == true), shared verbatim (static, header-only)
++// by the original path (atlas.cu, get_chart_connectivity_det) and the
++// sync-free path (atlas_fast.cu) so both compute bit-identical values.
++//
++// What the deterministic mode replaces (both paths):
++//  D1  cub::DeviceReduce::ReduceByKey's float aggregation of duplicate chart
++//      pairs (a decoupled look-back scan: the association order of partial
++//      sums depends on which predecessor tiles have published an inclusive
++//      prefix at look-back time -> not run-to-run repeatable in float).
++//      -> run starts (det_run_flags_kernel) + int ExclusiveSum +
++//         det_scatter_runs_kernel give the unique keys and run offsets
++//         (all integer, deterministic); the per-run length sum is a
++//         segmented reduce over the sorted lengths (cub::DeviceSegmentedReduce
++//         in the original path, its AgentReduce replica in the sync-free
++//         path -- same per-segment order).
++//  D2  get_chart_edge_cnt_kernel's float atomicAdd chart perimeters
++//      (hardware-ordered). -> det_chart_perim_kernel: sequential sum over the
++//      chart's incident edges in increasing edge id.
++//  D3  get_chart_edge_adjacency_kernel's atomicAdd slot assignment (order of
++//      each chart's incident-edge list; consumers are order-independent, but
++//      D2 needs a fixed order). -> the (chart, edge) pairs are radix-sorted
++//      (det_expand_chart_keys_kernel + cub::DeviceRadixSort::SortPairs,
++//      stable), giving each chart's edges in increasing edge id.
++// (The fourth source, the atomic order of vert2face lists -- which reaches
++// compute_charts via edge2face -> refine_charts_kernel's candidate order and
++// simplify via the QEM/skinny sums -- is handled by sort_csr_segments_kernel
++// in shared.h, applied in get_vertex_face_adjacency / simplify_fast.cu.)
++#pragma once
++
++#include <cuda.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++#include <climits>
++
++
++namespace fastpixal3d_cumesh_ns {
++
++
++static __global__ void det_run_flags_kernel(const uint64_t* sorted_keys, const int M, int* flags) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    flags[tid] = (tid == 0 || sorted_keys[tid] != sorted_keys[tid - 1]) ? 1 : 0;
++}
++
++
++// unique_keys[r] / run_offsets[r] for each run r; run_offsets[num_runs] = M;
++// *d_num_runs = number of runs.
++static __global__ void det_scatter_runs_kernel(
++    const uint64_t* sorted_keys, const int* flags, const int* run_index, const int M,
++    uint64_t* unique_keys, int* run_offsets, int* d_num_runs
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    if (flags[tid]) {
++        int r = run_index[tid];
++        unique_keys[r] = sorted_keys[tid];
++        run_offsets[r] = tid;
++    }
++    if (tid == M - 1) {
++        int n = run_index[tid] + flags[tid];
++        run_offsets[n] = M;
++        *d_num_runs = n;
++    }
++}
++
++
++// (chart, edge) pairs laid out as [2e] = (c0(e), e), [2e+1] = (c1(e), e);
++// entries with e >= E (padding) get key INT_MAX / value -1 so they sort last.
++static __global__ void det_expand_chart_keys_kernel(
++    const uint64_t* chart_adj, const int* d_E, const int E_max, const int* d_skip, int* keys2, int* vals2
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= E_max) return;
++    if (d_skip != nullptr && *d_skip) return;
++    if (d_E != nullptr && tid >= *d_E) {
++        keys2[2 * tid] = INT_MAX;
++        keys2[2 * tid + 1] = INT_MAX;
++        vals2[2 * tid] = -1;
++        vals2[2 * tid + 1] = -1;
++        return;
++    }
++    uint64_t c = chart_adj[tid];
++    int c0 = int(c >> 32);
++    int c1 = int(c & 0xFFFFFFFF);
++    keys2[2 * tid] = c0;
++    keys2[2 * tid + 1] = c1;
++    vals2[2 * tid] = tid;
++    vals2[2 * tid + 1] = tid;
++}
++
++
++// perim[c] = sum of the lengths of chart c's incident edges, in increasing
++// edge id (chart2edge is sorted per chart).
++static __global__ void det_chart_perim_kernel(
++    const int* chart2edge, const int* chart2edge_offset, const float* chart_adj_length,
++    const int* d_C, const int C_max, const int* d_skip, float* chart_perims
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= C_max) return;
++    if (d_skip != nullptr && *d_skip) return;
++    if (d_C != nullptr && tid >= *d_C) return;
++    float s = 0.0f;
++    for (int k = chart2edge_offset[tid]; k < chart2edge_offset[tid + 1]; k++) {
++        s += chart_adj_length[chart2edge[k]];
++    }
++    chart_perims[tid] = s;
++}
++
++
++} // namespace fastpixal3d_cumesh_ns
+diff --git a/src/atlas_fast.cu b/src/atlas_fast.cu
+new file mode 100644
+index 0000000..79a9149
+--- /dev/null
++++ b/src/atlas_fast.cu
+@@ -0,0 +1,1540 @@
++// atlas_fast.cu -- sync-free variant of CuMesh::compute_charts (fastpixal3d_cumesh).
++//
++// This file is NEW code (not a rename of upstream atlas.cu). It implements
++// CuMesh::compute_charts_sync_free(), which runs the same algorithm as
++// CuMesh::compute_charts() (atlas.cu, kept callable and untouched apart from
++// the namespace rename) but with every per-round host decision moved to the
++// device, so the whole
++//     for global_iterations { while(true){collapse} for refine_iterations{refine} reassign }
++// loop nest is enqueued without a host<->device round trip per round.
++//
++// ---------------------------------------------------------------------------
++// HOST DECISION POINTS IN THE ORIGINAL (atlas.cu) AND THEIR REPLACEMENTS
++// (line numbers refer to sources/CuMesh/src/atlas.cu)
++//
++//  H1  get_chart_connectivity(): D2H read of ReduceByKey's num_runs into
++//      atlas_chart_adj.size (l.~571) and a second D2H read of the last key
++//      to trim the UINT64_MAX "same chart" sentinel run (l.~579-585).
++//      -> The sort + ReduceByKey run at the FIXED size M = manifold_face_adj
++//         .size (M never changes inside compute_charts: the mesh itself is
++//         not modified). num_runs is written straight into the device state
++//         (CS_NUM_RUNS); af_trim_and_begin_kernel (1 thread) applies the
++//         sentinel trim on-device and publishes E into CS_E. Every kernel
++//         that was launched with grid=E is launched with grid=ceil(M/BLOCK)
++//         and early-returns for tid >= CS_E.
++//
++//  H2  compute_charts(): `if (atlas_chart_adj.size == 0) break;` (l.~1121)
++//      -> af_trim_and_begin_kernel sets CS_WHILE_DONE when E == 0.
++//
++//  H3  get_chart_connectivity(): C = atlas_num_charts (host int) sizes
++//      chart2edge_cnt/perims/offset and the ExclusiveSum over C+1 (l.~596-640).
++//      -> Buffers are sized once at the upper bound C0 = F (charts only merge
++//         in the collapse loop; refine never creates ids; reassign can split
++//         charts but the count is trivially <= F). cnt/perims for c >= C stay
++//         zero (they are memset each round and only c < C are ever touched),
++//         so ExclusiveSum over C0+1 entries yields the identical prefix for
++//         [0, C] (an int exclusive sum at index i depends only on entries
++//         < i; entries >= C are 0). The offsets beyond C are never read.
++//
++//  H4  compute_chart_normal_cones(): C = atlas_num_charts (host int) is the
++//      num_segments argument of three cub::DeviceSegmentedReduce calls
++//      (l.~695-780) and sizes the RLE/ExclusiveSum that build the segment
++//      offsets (l.~660-690), each followed by cudaStreamSynchronize.
++//      -> Segment offsets are built by two kernels (fill with F, then scatter
++//         run starts from the sorted chart ids) into a C0+1 array; segments
++//         c >= C are empty. The three SegmentedReduce calls are replaced by
++//         af_segmented_reduce_kernel, which instantiates CUB's OWN
++//         cub::AgentReduce with the OWN policy CUB's DeviceSegmentedReduceKernel
++//         would pick for this arch (DeviceReducePolicy<...>::MaxPolicy::
++//         ActivePolicy::ReducePolicy) and runs ConsumeRange(begin,end) per
++//         segment exactly like that kernel, but loops over segments
++//         [blockIdx.x, *d_num_segments) with a fixed grid instead of one
++//         block per (host-known) segment. The per-segment reduction order is
++//         therefore the same code path as the original -> bit-identical
++//         chart areas / normals / cone half angles. (A plain cub call padded
++//         to C0 segments would work too but launches up to F ~ 25M empty
++//         blocks per call, ~3 calls per cones evaluation, ~330 evaluations
++//         per compute_charts: prohibitively slow.)
++//
++//  H5  compute_charts(): D2H read of end_flag after collapse_edges_kernel,
++//      `if (h_end_flag == 1) break;` (l.~1173-1175).
++//      -> af_collapse_decide_kernel (1 thread) sets CS_WHILE_DONE from the
++//         device end flag; the loop is a fixed `max_rounds` host loop in
++//         which every custom kernel early-exits once CS_WHILE_DONE is set,
++//         so post-convergence rounds are no-ops (the fixed-size CUB calls
++//         still run, on frozen inputs, and their outputs are never consumed
++//         once the flag is set). With `sync_every` > 0 the host additionally
++//         polls the flag every sync_every rounds so that the number of
++//         wasted (no-op) rounds is bounded by sync_every-1 -- see
++//         compute_charts_sync_free() for the exact accounting; sync_every=0
++//         gives the pure fixed-round form.
++//
++//  H6  compress_ids() (shared.h): D2H read of the number of unique ids
++//      (new atlas_num_charts), plus 4 cudaMalloc / 4 cudaFree per call.
++//      -> af_compress_ids(): same sort / diff / exclusive-sum / scatter
++//         pipeline on preallocated scratch at a fixed size N, with the count
++//         written to CS_C on-device (af_read_count_kernel reads the scanned
++//         diff array at index n_real-1, where n_real is CS_C for the padded
++//         vertices_map case and N for the chart_ids case). Padding for the
++//         vertices_map case: entries [C, C0) are their own index (arange),
++//         i.e. strictly larger than every real entry (< C), so they sort
++//         after all real entries and cannot change the dense relabeling of
++//         the real prefix; the diff flag of the last real sorted entry is 1
++//         either way (it differs from the first padding entry, matching the
++//         original's forced 1 at N-1).
++//
++//  H7  compute_charts(): the `swap_buffers(atlas_chart_ids, temp_storage)`
++//      after index_kernel (l.~1187) is a host-side pointer swap that must
++//      NOT happen in a skipped (post-convergence) round.
++//      -> The chart-id relabeling `ids[f] = map[ids[f]]` is done IN PLACE
++//         (each thread reads and writes only its own slot; map is read-only)
++//         by af_index_inplace_kernel, so no swap is needed. Result identical.
++//
++//  H8  reassign_chart_ids(): do { hook; compress; D2H read end_flag } while
++//      (end_flag == 0) (l.~880-905).
++//      -> Fixed `max_uf_passes` passes; af_uf_begin/af_uf_decide (1 thread)
++//         maintain CS_UF_END / CS_UF_DONE on-device and hook/compress
++//         early-exit once CS_UF_DONE is set (a converged pass is already a
++//         no-op for these kernels, the guard just makes it free). The final
++//         labels are order-independent: pointers only ever decrease
++//         (atomicMin), the minimum face id of a component is always a root,
++//         and at convergence every face of a component points to that
++//         minimum -> deterministic partition and labels regardless of how
++//         many passes it took.
++//
++//  H9  Every Buffer<T>::free()/resize() growth (cudaStreamSynchronize +
++//      cudaFree) and every cudaMalloc/cudaFree in the helpers.
++//      -> One arena allocation for all scratch, sized up front; one free at
++//         the end. cub temp storage is sized once to the max of all queries.
++//
++//  H10 The final `atlas_num_charts` (used by construct_chart_mesh and
++//      returned by read_atlas_charts) -> ONE D2H read at the very end (this
++//      is inherent: the caller needs the number on the host).
++//
++// DETERMINISTIC MODE (CuMesh::deterministic == true, opt-in, both paths):
++// the original algorithm is NOT run-to-run repeatable (measured: two
++// original compute_charts runs on the same 190k-face mesh assign 80-95% of
++// the faces to different charts), because of float atomicAdd perimeters,
++// ReduceByKey's look-back float sums, and atomic-ordered vert2face lists
++// (-> edge2face -> refine candidate order). Exact original-vs-sync-free
++// equality can therefore only be verified in a mode where both paths
++// replace those three constructs by order-fixed equivalents; see
++// atlas_det.cuh (D1-D3) and shared.h sort_csr_segments_kernel. In that mode
++// this file uses the SAME kernels as atlas.cu's get_chart_connectivity_det.
++//
++// What is deliberately NOT changed in the default mode (kept identical to the
++// original so the two paths see the same nondeterminism): get_chart_edge_cnt_kernel's
++// float atomicAdd perimeter accumulation and the atomicAdd slot assignment
++// in get_chart_edge_adjacency_kernel (order-independent consumer),
++// ReduceByKey's float length aggregation (CUB decoupled look-back), the
++// collapse/refine/hook kernels' arithmetic (copied verbatim, only an
++// early-exit guard and a device count pointer added).
++// ---------------------------------------------------------------------------
++
++#include "cumesh.h"
++#include "dtypes.cuh"
++#include "shared.h"
++#include "atlas_det.cuh"
++#include <cub/cub.cuh>
++#include <c10/cuda/CUDAStream.h>
++#include <algorithm>
++#include <vector>
++#include <limits>
++
++
++namespace fastpixal3d_cumesh_ns {
++
++// defined (non-static) in atlas.cu
++void construct_chart_mesh(CuMesh& mesh, cudaStream_t stream);
++
++namespace {
++
++// Device-resident state slots (int).
++enum {
++    CS_C = 0,          // current number of charts
++    CS_E = 1,          // current number of chart-adjacency edges (after sentinel trim)
++    CS_END_FLAG = 2,   // collapse round: 1 = no edge collapsed this round
++    CS_WHILE_DONE = 3, // collapse loop converged (or E == 0)
++    CS_ROUNDS = 4,     // number of collapse rounds executed this global iteration (incl. the terminating one)
++    CS_UF_END = 5,     // union-find pass: 1 = no hook happened
++    CS_UF_DONE = 6,    // union-find converged
++    CS_UF_PASSES = 7,  // union-find passes executed this global iteration
++    CS_NUM_RUNS = 8,   // ReduceByKey num_runs output (before sentinel trim)
++    CS_SIZE = 9,
++    CS_STATS_STRIDE = 4, // per global iteration: rounds, while_done, uf_passes, uf_done
++};
++
++constexpr int AF_SEGREDUCE_MAX_GRID = 8192;
++
++
++// CO1: smallest K such that (1<<K) > n, ROUNDED UP to a multiple of 4 (whole
++// number of cub::DeviceRadixSort's 8-bit digit passes) -- same helper as
++// simplify_fast.cu's sf_bits_needed (duplicated here rather than shared:
++// atlas_fast.cu and simplify_fast.cu are separate translation units, and
++// this is a 6-line, single-use-per-file helper, not worth a shared header
++// for). Host-only.
++inline int af_bits_needed(int n) {
++    int k = 1;
++    while ((int64_t(1) << k) <= int64_t(n)) k++;
++    return (k + 3) & ~3;
++}
++
++
++__device__ inline uint64_t af_pack_key_value_positive(int key, float value) {
++    unsigned int v = __float_as_uint(value);
++    return (static_cast<uint64_t>(v) << 32) |
++           static_cast<unsigned int>(key);
++}
++
++
++// Same functor body as atlas.cu's Float3Add (the type identity does not
++// affect the reduction order; only the operator body does).
++struct AfFloat3Add
++{
++    __host__ __device__
++    float3 operator()(const float3 &a, const float3 &b) const
++    {
++        return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
++    }
++};
++
++
++// ---------------------------------------------------------------------------
++// Fixed-grid replica of cub::DeviceSegmentedReduceKernel (H4).
++// ---------------------------------------------------------------------------
++template <typename ChainedPolicyT,
++          typename InputIteratorT,
++          typename OutputIteratorT,
++          typename OffsetIteratorT,
++          typename OffsetT,
++          typename ReductionOpT,
++          typename InitT,
++          typename AccumT>
++__global__ void __launch_bounds__(int(ChainedPolicyT::ActivePolicy::ReducePolicy::BLOCK_THREADS))
++af_segmented_reduce_kernel(
++    InputIteratorT d_in,
++    OutputIteratorT d_out,
++    OffsetIteratorT d_begin_offsets,
++    OffsetIteratorT d_end_offsets,
++    const int* d_num_segments,
++    const int* d_skip,
++    ReductionOpT reduction_op,
++    InitT init)
++{
++    // Same agent + policy as cub::DeviceSegmentedReduceKernel (dispatch_reduce.cuh).
++    using AgentReduceT =
++        cub::AgentReduce<typename ChainedPolicyT::ActivePolicy::ReducePolicy,
++                         InputIteratorT,
++                         OutputIteratorT,
++                         OffsetT,
++                         ReductionOpT,
++                         AccumT>;
++
++    __shared__ typename AgentReduceT::TempStorage temp_storage;
++
++    if (d_skip != nullptr && *d_skip) return;
++    const int num_segments = *d_num_segments;
++
++    for (int seg = blockIdx.x; seg < num_segments; seg += gridDim.x) {
++        OffsetT segment_begin = d_begin_offsets[seg];
++        OffsetT segment_end   = d_end_offsets[seg];
++
++        if (segment_begin == segment_end) {
++            if (threadIdx.x == 0) {
++                *(d_out + seg) = init;
++            }
++        } else {
++            AccumT block_aggregate = AgentReduceT(temp_storage, d_in, reduction_op).ConsumeRange(segment_begin, segment_end);
++            if (threadIdx.x == 0) {
++                // cub::detail::reduce::finalize_and_store_aggregate for a plain InitT
++                *(d_out + seg) = reduction_op(init, block_aggregate);
++            }
++        }
++        // The block-reduce scratch is reused by the next segment (the CUB
++        // kernel processes exactly one segment per block and needs no such
++        // barrier).
++        __syncthreads();
++    }
++}
++
++
++template <typename InputT, typename OutputT, typename ReductionOpT, typename InitT>
++void af_segmented_reduce(
++    InputT* d_in,
++    OutputT* d_out,
++    const int* d_begin_offsets,
++    const int* d_end_offsets,
++    const int* d_num_segments,
++    const int* d_skip,
++    int max_segments,
++    ReductionOpT reduction_op,
++    InitT init,
++    cudaStream_t stream)
++{
++    // Mirror DispatchSegmentedReduce's type derivation exactly
++    // (dispatch_reduce.cuh: OffsetT = offset iterator value type, InitT as
++    // passed by the DeviceSegmentedReduce wrapper, AccumT =
++    // __accumulator_t<Op, value_t<InputIt>, InitT>).
++    using OffsetT = int;
++    using AccumT = ::cuda::std::__accumulator_t<ReductionOpT, InputT, InitT>;
++    using PolicyHub = cub::DeviceReducePolicy<AccumT, OffsetT, ReductionOpT>;
++    using MaxPolicyT = typename PolicyHub::MaxPolicy;
++    // All of CUB 2.x's reduce policies use 256 threads; the device side
++    // resolves ActivePolicy via __CUDA_ARCH__, the host side must launch with
++    // the same block size.
++    constexpr int BLOCK_THREADS = PolicyHub::Policy600::ReducePolicy::BLOCK_THREADS;
++    static_assert(PolicyHub::Policy350::ReducePolicy::BLOCK_THREADS == BLOCK_THREADS, "policy block size mismatch");
++    static_assert(PolicyHub::Policy300::ReducePolicy::BLOCK_THREADS == BLOCK_THREADS, "policy block size mismatch");
++
++    int grid = std::min(std::max(max_segments, 1), AF_SEGREDUCE_MAX_GRID);
++    af_segmented_reduce_kernel<MaxPolicyT, InputT*, OutputT*, const int*, OffsetT, ReductionOpT, InitT, AccumT>
++        <<<grid, BLOCK_THREADS, 0, stream>>>(
++            d_in, d_out, d_begin_offsets, d_end_offsets, d_num_segments, d_skip, reduction_op, init);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++
++// ---------------------------------------------------------------------------
++// Kernels: verbatim copies of atlas.cu's static kernels with (a) a device
++// count pointer instead of a host int for the shrinking sizes and (b) an
++// early-exit on the device skip flag.
++// ---------------------------------------------------------------------------
++
++__global__ void af_init_chart_adj_kernel(
++    const float3* vertices,
++    const int3* faces,
++    const int2* face_adj,
++    const int* chart_ids,
++    const int M,
++    const int* d_skip,
++    const int key_shift,
++    uint64_t* chart_adj,
++    float* length
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    if (*d_skip) return;
++
++    int f0 = face_adj[tid].x;
++    int f1 = face_adj[tid].y;
++
++    int c0 = chart_ids[f0];
++    int c1 = chart_ids[f1];
++
++    if (c0 == c1) {
++        chart_adj[tid] = UINT64_MAX;
++        length[tid] = 0.0f;
++        return;
++    }
++
++    int min_c = min(c0, c1);
++    int max_c = max(c0, c1);
++    // CO1: key_shift is 32 (fixed encoding) unless compact_chart_bits, in
++    // which case it's K = af_bits_needed(C0) -- see header "CO1". Either
++    // way this is an order-preserving injection (see compute_charts_sync_
++    // free's own comment on why UINT64_MAX still sorts last), so the sort/
++    // ReduceByKey output is unaffected.
++    chart_adj[tid] = (static_cast<uint64_t>(min_c) << key_shift) | static_cast<uint64_t>(max_c);
++
++    int3 tri0 = faces[f0];
++    int3 tri1 = faces[f1];
++
++    int t0_indices[3] = {tri0.x, tri0.y, tri0.z};
++    int common_v_indices[2];
++    int found_count = 0;
++
++    #pragma unroll
++    for (int i = 0; i < 3; ++i) {
++        int v = t0_indices[i];
++        if (v == tri1.x || v == tri1.y || v == tri1.z) {
++            if (found_count < 2) {
++                common_v_indices[found_count] = v;
++            }
++            found_count++;
++        }
++    }
++
++    if (found_count >= 2) {
++        float3 p0 = vertices[common_v_indices[0]];
++        float3 p1 = vertices[common_v_indices[1]];
++
++        float dx = p0.x - p1.x;
++        float dy = p0.y - p1.y;
++        float dz = p0.z - p1.z;
++
++        length[tid] = sqrtf(dx * dx + dy * dy + dz * dz);
++    } else {
++        length[tid] = 0.0f;
++    }
++}
++
++
++// H1 + H2 + the per-round `h_end_flag = 1` reset, in one thread.
++__global__ void af_trim_and_begin_kernel(int* st, const uint64_t* chart_adj) {
++    if (st[CS_WHILE_DONE]) return;
++    st[CS_END_FLAG] = 1;
++    st[CS_ROUNDS] += 1;
++    int E = st[CS_NUM_RUNS];
++    if (E > 0 && chart_adj[E - 1] == UINT64_MAX) E -= 1;
++    st[CS_E] = E;
++    if (E == 0) st[CS_WHILE_DONE] = 1;
++}
++
++
++__global__ void af_get_chart_edge_cnt_kernel(
++    const uint64_t* chart_adj,
++    const float* chart_adj_length,
++    const int* d_E,
++    const int M,
++    const int* d_skip,
++    const int key_shift, const uint64_t key_mask,
++    int* chart2edge_cnt,
++    float* chart_perim
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    if (*d_skip) return;
++    if (tid >= *d_E) return;
++
++    // get edge
++    uint64_t c = chart_adj[tid];
++    float l = chart_adj_length[tid];
++    int c0 = int(c >> key_shift);
++    int c1 = int(c & key_mask);
++
++    // count vertex adjacent edge number
++    atomicAdd(&chart2edge_cnt[c0], 1);
++    atomicAdd(&chart2edge_cnt[c1], 1);
++    atomicAdd(&chart_perim[c0], l);
++    atomicAdd(&chart_perim[c1], l);
++}
++
++
++__global__ void af_get_chart_edge_adjacency_kernel(
++    const uint64_t* chart_adj,
++    const int* d_E,
++    const int M,
++    const int* d_skip,
++    const int key_shift, const uint64_t key_mask,
++    int* chart2edge,
++    int* chart2edge_offset,
++    int* chart2edge_cnt
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    if (*d_skip) return;
++    if (tid >= *d_E) return;
++
++    // get edge
++    uint64_t c = chart_adj[tid];
++    int c0 = int(c >> key_shift);
++    int c1 = int(c & key_mask);
++
++    // assign connectivity
++    chart2edge[chart2edge_offset[c0] + atomicAdd(&chart2edge_cnt[c0], 1)] = tid;
++    chart2edge[chart2edge_offset[c1] + atomicAdd(&chart2edge_cnt[c1], 1)] = tid;
++}
++
++
++__global__ void af_compute_chart_adjacency_cost_kernel(
++    const uint64_t* chart_adj,
++    const float4* chart_normal_cones,
++    const float* chart_adj_length,
++    const float* chart_perims,
++    const float* chart_areas,
++    float area_penalty_weight,
++    float perimeter_area_ratio_weight,
++    const int* d_E,
++    const int M,
++    const int* d_skip,
++    const int key_shift, const uint64_t key_mask,
++    float* chart_adj_costs
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    if (*d_skip) return;
++    if (tid >= *d_E) return;
++
++    uint64_t adj = chart_adj[tid];
++    int c0 = static_cast<int>(adj >> key_shift);
++    int c1 = static_cast<int>(adj & key_mask);
++
++    float4 cone0 = chart_normal_cones[c0];
++    float4 cone1 = chart_normal_cones[c1];
++    Vec3f axis0(cone0.x, cone0.y, cone0.z);
++    Vec3f axis1(cone1.x, cone1.y, cone1.z);
++    float half_angle0 = cone0.w;
++    float half_angle1 = cone1.w;
++    float cos_angle = axis0.dot(axis1);
++    float axis_angle = acosf(fmaxf(fminf(cos_angle, 1.0f), -1.0f));
++    float new_cone_low = fminf(-half_angle0, axis_angle - half_angle1);
++    float new_cone_high = fmaxf(half_angle0, axis_angle + half_angle1);
++    float new_half_angle = (new_cone_high - new_cone_low) * 0.5f;
++    float cost = new_half_angle;
++
++    // Chart area panelty
++    float new_area = (chart_areas[c0] + chart_areas[c1]);
++    cost += area_penalty_weight * new_area;
++
++    // Perim-area ration panelty
++    float new_perim = chart_perims[c0] + chart_perims[c1] - 2 * chart_adj_length[tid];
++    cost += perimeter_area_ratio_weight * (new_perim * new_perim / new_area);
++
++    chart_adj_costs[tid] = cost;
++}
++
++
++__global__ void af_propagate_cost_kernel(
++    const int* chart2edge,
++    const int* chart2edge_offset,
++    const float* edge_collapse_costs,
++    const int* d_C,
++    const int C0,
++    const int* d_skip,
++    uint64_t* propagated_costs
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= C0) return;
++    if (*d_skip) return;
++    if (tid >= *d_C) return;
++
++    // get edge with minimum cost
++    int min_eid = -1;
++    float min_cost = FLT_MAX;
++    for (int e = chart2edge_offset[tid]; e < chart2edge_offset[tid+1]; e++) {
++        int eid = chart2edge[e];
++        float cost = edge_collapse_costs[eid];
++        if (cost < min_cost || (cost == min_cost && eid < min_eid)) {
++            min_eid = eid;
++            min_cost = cost;
++        }
++    }
++
++    uint64_t cost = af_pack_key_value_positive(min_eid, min_cost);
++    propagated_costs[tid] = cost;
++}
++
++
++__global__ void af_collapse_edges_kernel(
++    uint64_t* chart_adj,
++    const float* edge_collapse_costs,
++    const uint64_t* propagated_costs,
++    const float collapse_thresh,
++    const int* d_E,
++    const int M,
++    const int* d_skip,
++    const int key_shift, const uint64_t key_mask,
++    const bool skip_cone_writeback,
++    int* chart_map,
++    float4* chart_normal_cones,
++    int* end_flag
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    if (*d_skip) return;
++    if (tid >= *d_E) return;
++
++    float cost = edge_collapse_costs[tid];
++    if (cost > collapse_thresh) return;
++
++    // get edge
++    uint64_t c = chart_adj[tid];
++    int c0 = int(c >> key_shift);
++    int c1 = int(c & key_mask);
++
++    // check if this edge has the minimum cost among neighboring charts
++    uint64_t pack = af_pack_key_value_positive(tid, cost);
++    if (propagated_costs[c0] < pack || propagated_costs[c1] < pack) return;
++
++    // collapse edge
++    chart_map[c1] = c0;
++    *end_flag = 0;
++
++    // CO2: this cone update is PROVABLY dead in the current call pattern --
++    // see the header comment "CO2" for the full data-flow argument (every
++    // round that runs for real starts with af_compute_chart_normal_cones
++    // fully recomputing chart_normal_cones[] from the actual face data via
++    // a fresh segmented reduce, unconditionally overwriting whatever this
++    // write produced; refine's own call to that function also always runs
++    // unconditionally, d_skip=nullptr). skip_cone_writeback=true skips it
++    // entirely; default false keeps the original (redundant but harmless)
++    // computation for a conservative, bit-for-bit-safe default.
++    if (skip_cone_writeback) return;
++
++    // update cone
++    float4 cone0 = chart_normal_cones[c0];
++    float4 cone1 = chart_normal_cones[c1];
++    Vec3f axis0(cone0.x, cone0.y, cone0.z);
++    Vec3f axis1(cone1.x, cone1.y, cone1.z);
++    float half_angle0 = cone0.w;
++    float half_angle1 = cone1.w;
++    float cos_angle = axis0.dot(axis1);
++    float axis_angle = acosf(fmaxf(fminf(cos_angle, 1.0f), -1.0f));
++    float new_cone_low = fminf(-half_angle0, axis_angle - half_angle1);
++    float new_cone_high = fmaxf(half_angle0, axis_angle + half_angle1);
++    float new_half_angle = (new_cone_high - new_cone_low) * 0.5f;
++    Vec3f new_axis;
++    if (axis_angle < 1e-3f) {
++        new_axis = axis0;
++    } else {
++        float new_axis_angle = (new_cone_high + new_cone_low) * 0.5f;
++        new_axis = axis0 * cosf(new_axis_angle) + (axis1 - axis0 * cos_angle).normalized() * sinf(new_axis_angle);
++        new_axis.normalize();
++    }
++    chart_normal_cones[c0] = make_float4(new_axis.x, new_axis.y, new_axis.z, new_half_angle);
++}
++
++
++// H5: the `if (h_end_flag == 1) break;` decision.
++__global__ void af_collapse_decide_kernel(int* st) {
++    if (st[CS_WHILE_DONE]) return;
++    if (st[CS_END_FLAG] == 1) st[CS_WHILE_DONE] = 1;
++}
++
++
++// --- compute_chart_normal_cones helpers ---
++
++__global__ void af_fill_int_kernel(int* array, const int N, const int value, const int* d_skip) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= N) return;
++    if (d_skip != nullptr && *d_skip) return;
++    array[tid] = value;
++}
++
++
++// Segment offsets from the sorted (dense, every id in [0,C) present) chart
++// ids: offsets[c] = first sorted position of c; offsets[c] for c >= C was
++// pre-filled with F by af_fill_int_kernel, so those segments are empty and
++// offsets[C] == F as in the original's exclusive sum.
++__global__ void af_segment_starts_kernel(const int* sorted_chart_ids, const int F, const int* d_skip, int* offsets) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    if (d_skip != nullptr && *d_skip) return;
++    int c = sorted_chart_ids[tid];
++    if (tid == 0 || sorted_chart_ids[tid - 1] != c) {
++        offsets[c] = tid;
++    }
++}
++
++
++template<typename T>
++__global__ void af_index_kernel(const T* values, const int* indices, const int N, const int* d_skip, T* output) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= N) return;
++    if (d_skip != nullptr && *d_skip) return;
++    output[tid] = values[indices[tid]];
++}
++
++
++// CO3: af_index_kernel<float> (areas) + af_index_kernel<float3> (normals)
++// fused into one launch -- same `indices` permutation, same N, independent
++// destinations; purely mechanical (two gathers done by one thread instead
++// of two kernels' worth of threads), no value changes.
++__global__ void af_gather_area_normal_kernel(
++    const float* face_areas, const float3* face_normals, const int* indices, const int N,
++    const int* d_skip, float* sorted_areas, float3* sorted_normals
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= N) return;
++    if (d_skip != nullptr && *d_skip) return;
++    int idx = indices[tid];
++    sorted_areas[tid] = face_areas[idx];
++    sorted_normals[tid] = face_normals[idx];
++}
++
++
++// CO3: arange_kernel(faces_ids, F) + af_fill_int_kernel(chart_offsets, C0+1,
++// F) fused into one launch -- independent arrays/domains (C0 == F always,
++// see compute_charts_sync_free), no data dependency between them; purely
++// mechanical. Unconditional (no d_skip check) on both halves: arange_kernel
++// never had one (shared.h), and af_fill_int_kernel's own skip-gate was pure
++// wasted-work avoidance with no consumer-visible effect (both writes are
++// idempotent -- the same deterministic content every call -- and nothing
++// downstream ever reads either array in a round where the fill would have
++// been skipped, since every consumer is itself skip-gated); this simply
++// runs those two idempotent writes unconditionally, marginally undoing part
++// of the no-op-round savings the skip-gate was providing (bounded by
++// sync_every-1 wasted rounds) in exchange for one fewer launch every real
++// round.
++__global__ void af_init_cones_prep_kernel(int* faces_ids, const int F, int* chart_offsets, const int C0p1, const int fill_value) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid < F) faces_ids[tid] = tid;
++    if (tid < C0p1) chart_offsets[tid] = fill_value;
++}
++
++
++__global__ void af_normalize_kernel(float3* chart_normals, const int* d_C, const int C0, const int* d_skip) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= C0) return;
++    if (d_skip != nullptr && *d_skip) return;
++    if (tid >= *d_C) return;
++
++    float3 n = chart_normals[tid];
++    float norm = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
++    if (norm > 0.0f) {
++        n.x /= norm;
++        n.y /= norm;
++        n.z /= norm;
++    }
++    chart_normals[tid] = n;
++}
++
++
++__global__ void af_normal_diff_kernel(
++    const float3* chart_normals,
++    const float3* sorted_face_normals,
++    const int* sorted_chart_ids,
++    const int F,
++    const int* d_skip,
++    float* normal_diff
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    if (d_skip != nullptr && *d_skip) return;
++
++    int c = sorted_chart_ids[tid];
++    Vec3f n(chart_normals[c]);
++    Vec3f fn(sorted_face_normals[tid]);
++    normal_diff[tid] = acosf(fmaxf(fminf(n.dot(fn), 1.0f), -1.0f));
++}
++
++
++__global__ void af_update_normal_cones_kernel(
++    float4* chart_normal_cones,
++    const float3* chart_normals,
++    const float* new_cone_half_angles,
++    const int* d_C,
++    const int C0,
++    const int* d_skip
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= C0) return;
++    if (d_skip != nullptr && *d_skip) return;
++    if (tid >= *d_C) return;
++
++    float3 n = chart_normals[tid];
++    float half_angle = new_cone_half_angles[tid];
++    chart_normal_cones[tid] = make_float4(n.x, n.y, n.z, half_angle);
++}
++
++
++// --- compress_ids helpers (H6) ---
++
++__global__ void af_get_diff_kernel(const int* ids_sorted, int* ids_diff, const int N) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= N) return;
++    if (tid == N-1) {
++        ids_diff[tid] = 1;
++        return;
++    }
++    if (ids_sorted[tid] != ids_sorted[tid+1]) {
++        ids_diff[tid] = 1;
++    } else {
++        ids_diff[tid] = 0;
++    }
++}
++
++
++__global__ void af_scatter_kernel(const int* indices, const int* values, const int N, const int* d_skip, int* output) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= N) return;
++    if (d_skip != nullptr && *d_skip) return;
++    output[indices[tid]] = values[tid];
++}
++
++
++__global__ void af_read_count_kernel(const int* scanned_flags, const int* d_n_real, const int N, const int* d_skip, int* d_count_out) {
++    if (d_skip != nullptr && *d_skip) return;
++    int n = (d_n_real != nullptr) ? *d_n_real : N;
++    *d_count_out = scanned_flags[n - 1] + 1;
++}
++
++
++// H7: in-place relabel ids[f] = map[ids[f]].
++__global__ void af_index_inplace_kernel(const int* map, int* chart_ids, const int F, const int* d_skip) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    if (*d_skip) return;
++    chart_ids[tid] = map[chart_ids[tid]];
++}
++
++
++// verbatim copy of atlas.cu refine_charts_kernel
++__global__ void af_refine_charts_kernel(
++    const float4* chart_normal_cones,
++    const float3* face_normals,
++    const float3* vertices,
++    const uint64_t* edges,
++    const int3* face2edge,
++    const int* edge2face,
++    const int* edge2face_offset,
++    const size_t F,
++    const float lambda_smooth,
++    const int* chart_ids,         // Read-only (Input)
++    int* pong_chart_ids           // Write-only (Output)
++) {
++    const int fid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (fid >= F) return;
++
++    // 1. Load current face data
++    int current_c = chart_ids[fid];
++    Vec3f n(face_normals[fid]);
++
++    // local register cache for candidate list (triangle has at most 3 neighbors, plus self, max 4 candidates)
++    int candidates[4];
++    float smooth_scores[4];
++    int num_candidates = 0;
++
++    // init: add self to candidate list
++    candidates[0] = current_c;
++    smooth_scores[0] = 0.0f;
++    num_candidates = 1;
++
++    // 2. Iterate over 3 edges to aggregate smooth scores
++    int eids[3] = { face2edge[fid].x, face2edge[fid].y, face2edge[fid].z };
++
++    #pragma unroll
++    for (int i = 0; i < 3; i++) {
++        int eid = eids[i];
++
++        // calculate edge length (as smooth weight)
++        // logic: if I add the neighbor's Chart, I can eliminate this edge as a boundary cost
++        int v0_idx = int(edges[eid] >> 32);
++        int v1_idx = int(edges[eid] & 0xFFFFFFFF);
++        Vec3f v0 = Vec3f(vertices[v0_idx]);
++        Vec3f v1 = Vec3f(vertices[v1_idx]);
++        float edge_len = (v1 - v0).norm();
++
++        int start = edge2face_offset[eid];
++        int end = edge2face_offset[eid + 1];
++
++        // Process edge neighbors
++        for (int j = start; j < end; j++) {
++            int neighbor_fid = edge2face[j];
++            if (neighbor_fid == fid) continue;
++
++            int neighbor_c = chart_ids[neighbor_fid]; // Read from Input buffer
++
++            int idx = -1;
++            for (int k = 0; k < num_candidates; ++k) {
++                if (candidates[k] == neighbor_c) {
++                    idx = k;
++                    break;
++                }
++            }
++
++            if (idx == -1 && num_candidates < 4) {
++                idx = num_candidates++;
++                candidates[idx] = neighbor_c;
++                smooth_scores[idx] = 0.0f;
++            }
++
++            if (idx != -1) {
++                smooth_scores[idx] += edge_len;
++            }
++        }
++    }
++
++    // 3. Evaluate candidates and pick best
++    int best_c = current_c;
++    float best_total_score = -1e9f;
++
++    for (int i = 0; i < num_candidates; ++i) {
++        int c = candidates[i];
++
++        // A. Geom score
++        float4 cone = chart_normal_cones[c];
++        Vec3f axis(cone.x, cone.y, cone.z);
++        float geo_sim = axis.dot(n); // [-1, 1]
++
++        // if invalid cone, skip
++        if (geo_sim <= 0.0f) continue;
++
++        // B. Smooth score
++        float smooth_sim = smooth_scores[i] * lambda_smooth;
++
++        float total_score = geo_sim + smooth_sim;
++
++        if (c == current_c) {
++            if (best_total_score == -1e9f) {
++                best_total_score = total_score;
++                best_c = c;
++            }
++        }
++
++        // C. Compare with best
++        float diff = total_score - best_total_score;
++        const float epsilon = 1e-5f; // dampening factor
++
++        if (diff > epsilon) {
++            // new best is significantly better than current best
++            best_total_score = total_score;
++            best_c = c;
++        }
++        else if (abs(diff) <= epsilon) {
++            // scores are very close, break tie by choosing smaller ID
++            if (c < best_c) {
++                best_total_score = total_score;
++                best_c = c;
++            }
++        }
++    }
++
++    // Write back to Output buffer
++    pong_chart_ids[fid] = best_c;
++}
++
++
++// --- reassign_chart_ids (H8) ---
++
++__global__ void af_uf_begin_kernel(int* st) {
++    if (st[CS_UF_DONE]) return;
++    st[CS_UF_END] = 1;
++    st[CS_UF_PASSES] += 1;
++}
++
++
++__global__ void af_hook_edges_if_same_chart_kernel(
++    const int2* adj,
++    const int* chart_ids,
++    const int M,
++    int* conn_comp_ids,
++    int* st
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= M) return;
++    if (st[CS_UF_DONE]) return;
++
++    // get adjacent faces
++    int f0 = adj[tid].x;
++    int f1 = adj[tid].y;
++    int c0 = chart_ids[f0];
++    int c1 = chart_ids[f1];
++    if (c0 != c1) return;
++
++    // union
++    // find roots
++    int root0 = conn_comp_ids[f0];
++    while (root0 != conn_comp_ids[root0]) {
++        root0 = conn_comp_ids[root0];
++    }
++    int root1 = conn_comp_ids[f1];
++    while (root1 != conn_comp_ids[root1]) {
++        root1 = conn_comp_ids[root1];
++    }
++
++    if (root0 == root1) return;
++
++    int high = max(root0, root1);
++    int low = min(root0, root1);
++    atomicMin(&conn_comp_ids[high], low);
++    st[CS_UF_END] = 0;
++}
++
++
++__global__ void af_compress_components_kernel(int* conn_comp_ids, const int F, const int* st) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F) return;
++    if (st[CS_UF_DONE]) return;
++
++    int p = conn_comp_ids[tid];
++    while (p != conn_comp_ids[p]) {
++        p = conn_comp_ids[p];
++    }
++    conn_comp_ids[tid] = p;
++}
++
++
++__global__ void af_uf_decide_kernel(int* st) {
++    if (st[CS_UF_DONE]) return;
++    if (st[CS_UF_END] == 1) st[CS_UF_DONE] = 1;
++}
++
++
++__global__ void af_global_iter_begin_kernel(int* st) {
++    st[CS_WHILE_DONE] = 0;
++    st[CS_ROUNDS] = 0;
++    st[CS_END_FLAG] = 1;
++    st[CS_UF_END] = 1;
++    st[CS_UF_DONE] = 0;
++    st[CS_UF_PASSES] = 0;
++}
++
++
++__global__ void af_global_iter_record_kernel(int* st, const int i) {
++    st[CS_SIZE + CS_STATS_STRIDE * i + 0] = st[CS_ROUNDS];
++    st[CS_SIZE + CS_STATS_STRIDE * i + 1] = st[CS_WHILE_DONE];
++    st[CS_SIZE + CS_STATS_STRIDE * i + 2] = st[CS_UF_PASSES];
++    st[CS_SIZE + CS_STATS_STRIDE * i + 3] = st[CS_UF_DONE];
++}
++
++
++// ---------------------------------------------------------------------------
++// Scratch arena: one cudaMalloc for everything (H9).
++// ---------------------------------------------------------------------------
++struct Arena {
++    char* base = nullptr;
++    size_t offset = 0;
++    bool dry_run = true;
++
++    template<typename T>
++    T* take(size_t n) {
++        size_t bytes = n * sizeof(T);
++        bytes = (bytes + 255) & ~size_t(255);
++        T* p = dry_run ? nullptr : reinterpret_cast<T*>(base + offset);
++        offset += bytes;
++        return p;
++    }
++};
++
++
++struct ChartsCtx {
++    int F = 0, M = 0, C0 = 0;
++    int grid_F = 0, grid_M = 0, grid_C0 = 0, grid_C0p1 = 0;
++    // CO1-CO3 (see compute_charts_sync_free's own header comment): all
++    // default to the plain sync-free behaviour. key_shift/key_mask/pair_end_bit
++    // pack/unpack the chart_adj (min_chart,max_chart) sort key (disabled
++    // whenever `deterministic`, since det_expand_chart_keys_kernel --
++    // shared, unmodified, with atlas.cu's own get_chart_connectivity_det --
++    // assumes the fixed 32/64 encoding); plain_end_bit narrows the two
++    // plain-int sorts (face-by-chart-id in af_compute_chart_normal_cones,
++    // and af_compress_ids' internal sort) unconditionally (unrelated to the
++    // chart_adj pair encoding, safe in both modes -- see header "CO1").
++    bool compact_chart_bits = false;
++    int key_shift = 32;
++    uint64_t key_mask = 0xFFFFFFFFull;
++    int pair_end_bit = 64;
++    int plain_end_bit = 32;
++    bool skip_cone_writeback = false;  // CO2
++    bool fuse_round_kernels = false;   // CO3
++    int* st = nullptr;
++    // connectivity
++    float* raw_lengths = nullptr;
++    uint64_t* sorted_keys = nullptr;
++    float* sorted_lengths = nullptr;
++    uint64_t* chart_adj = nullptr;
++    float* chart_adj_length = nullptr;
++    int* chart2edge_cnt = nullptr;     // C0 + 1
++    float* chart_perims = nullptr;     // C0 + 1
++    int* chart2edge_offset = nullptr;  // C0 + 1
++    int* chart2edge = nullptr;         // 2M
++    float* edge_costs = nullptr;       // M
++    uint64_t* propagated = nullptr;    // C0
++    int* vertices_map = nullptr;       // C0
++    float4* cones = nullptr;           // C0
++    float* chart_areas = nullptr;      // C0
++    // cones
++    int* sorted_chart_ids = nullptr;   // F
++    int* faces_ids = nullptr;          // F
++    int* argsorted_faces_ids = nullptr;// F
++    int* chart_offsets = nullptr;      // C0 + 1
++    float* sorted_face_areas = nullptr;// F
++    float3* sorted_face_normals = nullptr; // F
++    float3* chart_normals = nullptr;   // C0
++    float* normal_diff = nullptr;      // F
++    float* half_angles = nullptr;      // C0
++    // compress
++    int* cmp_indices = nullptr;        // F
++    int* cmp_argsorted = nullptr;      // F
++    int* cmp_sorted = nullptr;         // F
++    int* cmp_flags = nullptr;          // F
++    // deterministic mode (D1-D3), only carved when mesh.deterministic
++    bool det = false;
++    int* det_flags = nullptr;          // M
++    int* det_run_index = nullptr;      // M
++    int* det_run_offsets = nullptr;    // M + 1
++    int* det_keys2 = nullptr;          // 2M
++    int* det_sorted_keys2 = nullptr;   // 2M
++    int* det_vals2 = nullptr;          // 2M
++    // cub
++    char* cub_temp = nullptr;
++    size_t cub_temp_bytes = 0;
++    int num_state = 0;
++
++    void carve(Arena& a, int global_iterations) {
++        num_state = CS_SIZE + CS_STATS_STRIDE * global_iterations;
++        st = a.take<int>(num_state);
++        raw_lengths = a.take<float>(M);
++        sorted_keys = a.take<uint64_t>(M);
++        sorted_lengths = a.take<float>(M);
++        chart_adj = a.take<uint64_t>(M);
++        chart_adj_length = a.take<float>(M);
++        chart2edge_cnt = a.take<int>(C0 + 1);
++        chart_perims = a.take<float>(C0 + 1);
++        chart2edge_offset = a.take<int>(C0 + 1);
++        chart2edge = a.take<int>(2 * (size_t)M);
++        edge_costs = a.take<float>(M);
++        propagated = a.take<uint64_t>(C0);
++        vertices_map = a.take<int>(C0);
++        cones = a.take<float4>(C0);
++        chart_areas = a.take<float>(C0);
++        sorted_chart_ids = a.take<int>(F);
++        faces_ids = a.take<int>(F);
++        argsorted_faces_ids = a.take<int>(F);
++        chart_offsets = a.take<int>(C0 + 1);
++        sorted_face_areas = a.take<float>(F);
++        sorted_face_normals = a.take<float3>(F);
++        chart_normals = a.take<float3>(C0);
++        normal_diff = a.take<float>(F);
++        half_angles = a.take<float>(C0);
++        cmp_indices = a.take<int>(F);
++        cmp_argsorted = a.take<int>(F);
++        cmp_sorted = a.take<int>(F);
++        cmp_flags = a.take<int>(F);
++        if (det) {
++            det_flags = a.take<int>(M);
++            det_run_index = a.take<int>(M);
++            det_run_offsets = a.take<int>((size_t)M + 1);
++            det_keys2 = a.take<int>(2 * (size_t)M);
++            det_sorted_keys2 = a.take<int>(2 * (size_t)M);
++            det_vals2 = a.take<int>(2 * (size_t)M);
++        }
++        cub_temp = a.take<char>(cub_temp_bytes);
++    }
++};
++
++
++#if CUDART_VERSION >= 12090
++inline auto af_reduce_op() { return ::cuda::std::plus(); }
++#else
++inline auto af_reduce_op() { return cub::Sum(); }
++#endif
++
++
++// CO1: pair_end_bit/plain_end_bit are the actual bit ranges the runtime
++// sort calls will use (64/32 unless compact_chart_bits) -- sized for those
++// ranges so the arena's cub_temp is never under-allocated for a narrower
++// (equal-or-smaller-temp) sort. The plain_end_bit query below (N=c.F,
++// int/int SortPairs) also covers af_compute_chart_normal_cones' face-by-
++// chart-id sort: same N, same KeyT/ValueT, same bit range -> CUB's temp
++// size depends only on those, not the specific pointers.
++size_t af_query_cub_temp(ChartsCtx& c, cudaStream_t stream) {
++    size_t bytes = 0, max_bytes = 0;
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        nullptr, bytes, c.chart_adj, c.sorted_keys, c.raw_lengths, c.sorted_lengths,
++        c.M, 0, c.pair_end_bit, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
++        nullptr, bytes, c.sorted_keys, c.chart_adj, c.sorted_lengths, c.chart_adj_length,
++        c.st + CS_NUM_RUNS, af_reduce_op(), c.M, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
++        nullptr, bytes, c.chart2edge_cnt, c.chart2edge_offset, c.C0 + 1, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        nullptr, bytes, c.cmp_indices, c.cmp_sorted, c.cmp_indices, c.cmp_argsorted,
++        c.F, 0, c.plain_end_bit, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, bytes, c.cmp_flags, c.F, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    if (c.det) {
++        bytes = 0;
++        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, bytes, c.det_flags, c.det_run_index, c.M, stream));
++        max_bytes = std::max(max_bytes, bytes);
++        bytes = 0;
++        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++            nullptr, bytes, c.det_keys2, c.det_sorted_keys2, c.det_vals2, c.chart2edge,
++            2 * c.M, 0, sizeof(int) * 8, stream));
++        max_bytes = std::max(max_bytes, bytes);
++    }
++    return max_bytes;
++}
++
++
++// compute_chart_normal_cones, sync-free (H4). Reads mesh.atlas_chart_ids
++// (F ints) and CS_C; writes c.cones / c.chart_areas for charts [0, C).
++void af_compute_chart_normal_cones(CuMesh& mesh, ChartsCtx& c, const int* d_skip, cudaStream_t stream) {
++    const int F = c.F;
++    // 1. Sort faces by chart id (identical call to the original, CO1: end_bit
++    // narrowed to c.plain_end_bit instead of the fixed 32 when compact_chart_bits)
++    if (c.fuse_round_kernels) {
++        af_init_cones_prep_kernel<<<c.grid_C0p1, BLOCK_SIZE, 0, stream>>>(
++            c.faces_ids, F, c.chart_offsets, c.C0 + 1, F);
++        CUDA_CHECK(cudaGetLastError());
++    } else {
++        arange_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(c.faces_ids, F);
++        CUDA_CHECK(cudaGetLastError());
++    }
++    {
++        size_t bytes = c.cub_temp_bytes;
++        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++            c.cub_temp, bytes,
++            mesh.atlas_chart_ids.ptr, c.sorted_chart_ids,
++            c.faces_ids, c.argsorted_faces_ids,
++            F, 0, c.plain_end_bit, stream));
++    }
++    // 2. Segment offsets (replaces RLE + ExclusiveSum over a host-sized C+1)
++    if (!c.fuse_round_kernels) {
++        af_fill_int_kernel<<<c.grid_C0p1, BLOCK_SIZE, 0, stream>>>(c.chart_offsets, c.C0 + 1, F, d_skip);
++        CUDA_CHECK(cudaGetLastError());
++    }
++    af_segment_starts_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(c.sorted_chart_ids, F, d_skip, c.chart_offsets);
++    CUDA_CHECK(cudaGetLastError());
++    // 3. Chart areas and normals (CO3: gathers fused into one launch)
++    if (c.fuse_round_kernels) {
++        af_gather_area_normal_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(
++            mesh.face_areas.ptr, mesh.face_normals.ptr, c.argsorted_faces_ids, F, d_skip,
++            c.sorted_face_areas, c.sorted_face_normals);
++        CUDA_CHECK(cudaGetLastError());
++    } else {
++        af_index_kernel<float><<<c.grid_F, BLOCK_SIZE, 0, stream>>>(
++            mesh.face_areas.ptr, c.argsorted_faces_ids, F, d_skip, c.sorted_face_areas);
++        CUDA_CHECK(cudaGetLastError());
++        af_index_kernel<float3><<<c.grid_F, BLOCK_SIZE, 0, stream>>>(
++            mesh.face_normals.ptr, c.argsorted_faces_ids, F, d_skip, c.sorted_face_normals);
++        CUDA_CHECK(cudaGetLastError());
++    }
++    af_segmented_reduce<float, float, cub::Sum, float>(
++        c.sorted_face_areas, c.chart_areas, c.chart_offsets, c.chart_offsets + 1,
++        c.st + CS_C, d_skip, c.C0, cub::Sum(), float(), stream);
++
++    af_segmented_reduce<float3, float3, AfFloat3Add, float3>(
++        c.sorted_face_normals, c.chart_normals, c.chart_offsets, c.chart_offsets + 1,
++        c.st + CS_C, d_skip, c.C0, AfFloat3Add(), make_float3(0.0f, 0.0f, 0.0f), stream);
++    af_normalize_kernel<<<c.grid_C0, BLOCK_SIZE, 0, stream>>>(c.chart_normals, c.st + CS_C, c.C0, d_skip);
++    CUDA_CHECK(cudaGetLastError());
++
++    // 4. Normal difference
++    af_normal_diff_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(
++        c.chart_normals, c.sorted_face_normals, c.sorted_chart_ids, F, d_skip, c.normal_diff);
++    CUDA_CHECK(cudaGetLastError());
++
++    // 5. New cone half angles
++    af_segmented_reduce<float, float, cub::Max, float>(
++        c.normal_diff, c.half_angles, c.chart_offsets, c.chart_offsets + 1,
++        c.st + CS_C, d_skip, c.C0, cub::Max(), cub::Traits<float>::Lowest(), stream);
++
++    // 6. Update chart normal cones
++    af_update_normal_cones_kernel<<<c.grid_C0, BLOCK_SIZE, 0, stream>>>(
++        c.cones, c.chart_normals, c.half_angles, c.st + CS_C, c.C0, d_skip);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++
++// compress_ids, sync-free (H6): relabels ids[0, N) to dense ids in place and
++// writes the new count to d_count_out. d_n_real (nullable): number of REAL
++// entries at the front of ids (the rest are padding that sorts after them).
++void af_compress_ids(ChartsCtx& c, int* ids, int N, const int* d_n_real, int* d_count_out, const int* d_skip, cudaStream_t stream) {
++    const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    arange_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(c.cmp_indices, N);
++    CUDA_CHECK(cudaGetLastError());
++    {
++        size_t bytes = c.cub_temp_bytes;
++        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++            c.cub_temp, bytes,
++            ids, c.cmp_sorted,
++            c.cmp_indices, c.cmp_argsorted,
++            N, 0, c.plain_end_bit, stream));
++    }
++    af_get_diff_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(c.cmp_sorted, c.cmp_flags, N);
++    CUDA_CHECK(cudaGetLastError());
++    {
++        size_t bytes = c.cub_temp_bytes;
++        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(c.cub_temp, bytes, c.cmp_flags, N, stream));
++    }
++    af_scatter_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(c.cmp_argsorted, c.cmp_flags, N, d_skip, ids);
++    CUDA_CHECK(cudaGetLastError());
++    af_read_count_kernel<<<1, 1, 0, stream>>>(c.cmp_flags, d_n_real, N, d_skip, d_count_out);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++
++// One collapse round (steps 1-6 of the original while-loop body).
++void af_collapse_round(
++    CuMesh& mesh, ChartsCtx& c,
++    float threshold_cone_half_angle_rad, float area_penalty_weight, float perimeter_area_ratio_weight,
++    cudaStream_t stream
++) {
++    const int* skip = c.st + CS_WHILE_DONE;
++    const int M = c.M;
++
++    // 1. chart connectivity (CO1: c.key_shift/c.pair_end_bit narrow the
++    // packed (min_chart,max_chart) key when compact_chart_bits; both are
++    // fixed at 32/64 whenever this->deterministic, since det_expand_chart_
++    // keys_kernel below assumes the original encoding)
++    af_init_chart_adj_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++        mesh.vertices.ptr, mesh.faces.ptr, mesh.manifold_face_adj.ptr, mesh.atlas_chart_ids.ptr,
++        M, skip, c.key_shift, c.chart_adj, c.raw_lengths);
++    CUDA_CHECK(cudaGetLastError());
++    {
++        size_t bytes = c.cub_temp_bytes;
++        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++            c.cub_temp, bytes, c.chart_adj, c.sorted_keys, c.raw_lengths, c.sorted_lengths,
++            M, 0, c.pair_end_bit, stream));
++    }
++    if (c.det) {
++        // D1: deterministic run detection + segmented length sums
++        det_run_flags_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(c.sorted_keys, M, c.det_flags);
++        CUDA_CHECK(cudaGetLastError());
++        {
++            size_t bytes = c.cub_temp_bytes;
++            CUDA_CHECK(cub::DeviceScan::ExclusiveSum(c.cub_temp, bytes, c.det_flags, c.det_run_index, M, stream));
++        }
++        det_scatter_runs_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++            c.sorted_keys, c.det_flags, c.det_run_index, M, c.chart_adj, c.det_run_offsets, c.st + CS_NUM_RUNS);
++        CUDA_CHECK(cudaGetLastError());
++        af_segmented_reduce<float, float, cub::Sum, float>(
++            c.sorted_lengths, c.chart_adj_length, c.det_run_offsets, c.det_run_offsets + 1,
++            c.st + CS_NUM_RUNS, skip, M, cub::Sum(), float(), stream);
++    } else {
++        size_t bytes = c.cub_temp_bytes;
++        CUDA_CHECK(cub::DeviceReduce::ReduceByKey(
++            c.cub_temp, bytes, c.sorted_keys, c.chart_adj, c.sorted_lengths, c.chart_adj_length,
++            c.st + CS_NUM_RUNS, af_reduce_op(), M, stream));
++    }
++    af_trim_and_begin_kernel<<<1, 1, 0, stream>>>(c.st, c.chart_adj);
++    CUDA_CHECK(cudaGetLastError());
++
++    CUDA_CHECK(cudaMemsetAsync(c.chart2edge_cnt, 0, (c.C0 + 1) * sizeof(int), stream));
++    CUDA_CHECK(cudaMemsetAsync(c.chart_perims, 0, (c.C0 + 1) * sizeof(float), stream));
++    af_get_chart_edge_cnt_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++        c.chart_adj, c.chart_adj_length, c.st + CS_E, M, skip, c.key_shift, c.key_mask, c.chart2edge_cnt, c.chart_perims);
++    CUDA_CHECK(cudaGetLastError());
++    {
++        size_t bytes = c.cub_temp_bytes;
++        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
++            c.cub_temp, bytes, c.chart2edge_cnt, c.chart2edge_offset, c.C0 + 1, stream));
++    }
++    if (c.det) {
++        // D3 + D2: sorted per-chart edge lists, sequential perimeters
++        det_expand_chart_keys_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++            c.chart_adj, c.st + CS_E, M, skip, c.det_keys2, c.det_vals2);
++        CUDA_CHECK(cudaGetLastError());
++        {
++            size_t bytes = c.cub_temp_bytes;
++            CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++                c.cub_temp, bytes, c.det_keys2, c.det_sorted_keys2, c.det_vals2, c.chart2edge,
++                2 * M, 0, sizeof(int) * 8, stream));
++        }
++        det_chart_perim_kernel<<<c.grid_C0, BLOCK_SIZE, 0, stream>>>(
++            c.chart2edge, c.chart2edge_offset, c.chart_adj_length, c.st + CS_C, c.C0, skip, c.chart_perims);
++        CUDA_CHECK(cudaGetLastError());
++    } else {
++        CUDA_CHECK(cudaMemsetAsync(c.chart2edge_cnt, 0, (c.C0 + 1) * sizeof(int), stream));
++        af_get_chart_edge_adjacency_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++            c.chart_adj, c.st + CS_E, M, skip, c.key_shift, c.key_mask, c.chart2edge, c.chart2edge_offset, c.chart2edge_cnt);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    // 2. normal cones
++    af_compute_chart_normal_cones(mesh, c, skip, stream);
++
++    // 3. chart adjacency cost
++    af_compute_chart_adjacency_cost_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++        c.chart_adj, c.cones, c.chart_adj_length, c.chart_perims, c.chart_areas,
++        area_penalty_weight, perimeter_area_ratio_weight, c.st + CS_E, M, skip,
++        c.key_shift, c.key_mask, c.edge_costs);
++    CUDA_CHECK(cudaGetLastError());
++
++    // 4. propagate costs
++    af_propagate_cost_kernel<<<c.grid_C0, BLOCK_SIZE, 0, stream>>>(
++        c.chart2edge, c.chart2edge_offset, c.edge_costs, c.st + CS_C, c.C0, skip, c.propagated);
++    CUDA_CHECK(cudaGetLastError());
++
++    // 5. collapse edges
++    arange_kernel<<<c.grid_C0, BLOCK_SIZE, 0, stream>>>(c.vertices_map, c.C0);
++    CUDA_CHECK(cudaGetLastError());
++    af_collapse_edges_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++        c.chart_adj, c.edge_costs, c.propagated, threshold_cone_half_angle_rad,
++        c.st + CS_E, M, skip, c.key_shift, c.key_mask, c.skip_cone_writeback,
++        c.vertices_map, c.cones, c.st + CS_END_FLAG);
++    CUDA_CHECK(cudaGetLastError());
++    af_collapse_decide_kernel<<<1, 1, 0, stream>>>(c.st);
++    CUDA_CHECK(cudaGetLastError());
++
++    // 6. compress chart ids (skipped on-device once converged)
++    af_compress_ids(c, c.vertices_map, c.C0, c.st + CS_C, c.st + CS_C, skip, stream);
++    af_index_inplace_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(
++        c.vertices_map, mesh.atlas_chart_ids.ptr, c.F, skip);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // anonymous namespace
++
++
++std::vector<int> CuMesh::compute_charts_sync_free(
++    float threshold_cone_half_angle_rad,
++    int refine_iterations,
++    int global_iterations,
++    float smooth_strength,
++    float area_penalty_weight,
++    float perimeter_area_ratio_weight,
++    int max_rounds,
++    int sync_every,
++    int max_uf_passes,
++    bool compact_chart_bits,
++    bool skip_collapse_cone_writeback,
++    bool fuse_round_kernels
++) {
++    cudaStream_t stream = current_stream();
++    TORCH_CHECK(max_rounds > 0, "[CuMesh] compute_charts_sync_free: max_rounds must be positive");
++    TORCH_CHECK(max_uf_passes > 0, "[CuMesh] compute_charts_sync_free: max_uf_passes must be positive");
++    TORCH_CHECK(sync_every >= 0, "[CuMesh] compute_charts_sync_free: sync_every must be >= 0");
++
++    // Same preconditions as the original (these helpers have their own
++    // host syncs; they run once, identically, in both paths).
++    if (this->manifold_face_adj.is_empty()) {
++        this->get_manifold_face_adjacency();
++    }
++    if (this->face_normals.is_empty()) {
++        this->compute_face_normals();
++    }
++    if (this->face_areas.is_empty()) {
++        this->compute_face_areas();
++    }
++
++    ChartsCtx c;
++    c.det = this->deterministic;
++    c.F = static_cast<int>(this->faces.size);
++    c.M = static_cast<int>(this->manifold_face_adj.size);
++    c.C0 = c.F;
++    // CO1-CO3 (see this function's own header comment for the full
++    // per-option writeup): all default to the plain sync-free behaviour.
++    c.compact_chart_bits = compact_chart_bits;
++    // key_shift/pair_end_bit pack the chart_adj (min_chart,max_chart) sort
++    // key -- disabled whenever deterministic (det_expand_chart_keys_kernel,
++    // shared unmodified with atlas.cu, assumes the fixed encoding).
++    c.key_shift = (compact_chart_bits && !c.det) ? af_bits_needed(c.C0) : 32;
++    c.key_mask = (c.key_shift >= 32) ? uint64_t(0xFFFFFFFFu) : ((uint64_t(1) << c.key_shift) - 1);
++    c.pair_end_bit = (compact_chart_bits && !c.det) ? 2 * c.key_shift : int(sizeof(uint64_t) * 8);
++    // plain_end_bit narrows the two plain-int sorts (face-by-chart-id in
++    // af_compute_chart_normal_cones, af_compress_ids' internal sort) --
++    // unconditional on determinism (unrelated to the chart_adj pair
++    // encoding: every value sorted is a real chart id in [0, C0), no
++    // sentinel padding, see header "CO1").
++    c.plain_end_bit = compact_chart_bits ? af_bits_needed(c.C0) : int(sizeof(int) * 8);
++    c.skip_cone_writeback = skip_collapse_cone_writeback;
++    c.fuse_round_kernels = fuse_round_kernels;
++    c.grid_F = (c.F + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    c.grid_M = (c.M + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    c.grid_C0 = (c.C0 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    c.grid_C0p1 = (c.C0 + 1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    if (c.grid_M < 1) c.grid_M = 1;
++
++    // Initialize chart ids (same as original)
++    const size_t F = this->faces.size;
++    this->atlas_chart_ids.resize(F);
++    this->atlas_num_charts = static_cast<int>(F);
++    arange_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(this->atlas_chart_ids.ptr, F);
++    CUDA_CHECK(cudaGetLastError());
++    this->temp_storage.resize(F * sizeof(int));  // ping-pong buffer for refine / union-find parents
++
++    // Scratch arena: dry-run carve to size, one cudaMalloc, real carve.
++    // The cub temp-storage query needs (any) pointers of the right types; the
++    // dry-run nullptrs are fine for size queries.
++    Arena arena;
++    arena.dry_run = true;
++    c.cub_temp_bytes = 0;
++    c.carve(arena, global_iterations);
++    c.cub_temp_bytes = af_query_cub_temp(c, stream);
++    arena.offset = 0;
++    c.carve(arena, global_iterations);
++    const size_t total_bytes = arena.offset;
++    CUDA_CHECK(cudaMalloc(&arena.base, total_bytes));
++    arena.dry_run = false;
++    arena.offset = 0;
++    c.carve(arena, global_iterations);
++
++    CUDA_CHECK(cudaMemsetAsync(c.st, 0, c.num_state * sizeof(int), stream));
++    {
++        // CS_C = F
++        af_fill_int_kernel<<<1, 1, 0, stream>>>(c.st + CS_C, 1, c.F, nullptr);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    std::vector<int> h_state(c.num_state, 0);
++    bool cap_error = false;
++    std::string cap_msg;
++
++    for (int i = 0; i < global_iterations && !cap_error; i++) {
++        af_global_iter_begin_kernel<<<1, 1, 0, stream>>>(c.st);
++        CUDA_CHECK(cudaGetLastError());
++
++        // --- collapse loop (H5) ---
++        for (int r = 0; r < max_rounds; r++) {
++            af_collapse_round(*this, c, threshold_cone_half_angle_rad, area_penalty_weight, perimeter_area_ratio_weight, stream);
++            if (sync_every > 0 && ((r + 1) % sync_every == 0) && (r + 1) < max_rounds) {
++                int h_done = 0;
++                CUDA_CHECK(cudaMemcpyAsync(&h_done, c.st + CS_WHILE_DONE, sizeof(int), cudaMemcpyDeviceToHost, stream));
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                if (h_done) break;
++            }
++        }
++
++        // --- refine (fixed host count, no decision) ---
++        for (int j = 0; j < refine_iterations; j++) {
++            af_compute_chart_normal_cones(*this, c, nullptr, stream);
++            af_refine_charts_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(
++                c.cones,
++                this->face_normals.ptr,
++                this->vertices.ptr,
++                this->edges.ptr,
++                this->face2edge.ptr,
++                this->edge2face.ptr,
++                this->edge2face_offset.ptr,
++                F,
++                smooth_strength,
++                this->atlas_chart_ids.ptr,
++                reinterpret_cast<int*>(this->temp_storage.ptr));
++            CUDA_CHECK(cudaGetLastError());
++            swap_buffers(this->atlas_chart_ids, this->temp_storage);
++            af_compress_ids(c, this->atlas_chart_ids.ptr, c.F, nullptr, c.st + CS_C, nullptr, stream);
++        }
++
++        // --- reassign chart ids (H8) ---
++        arange_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(reinterpret_cast<int*>(this->temp_storage.ptr), F);
++        CUDA_CHECK(cudaGetLastError());
++        for (int p = 0; p < max_uf_passes; p++) {
++            af_uf_begin_kernel<<<1, 1, 0, stream>>>(c.st);
++            af_hook_edges_if_same_chart_kernel<<<c.grid_M, BLOCK_SIZE, 0, stream>>>(
++                this->manifold_face_adj.ptr, this->atlas_chart_ids.ptr, c.M,
++                reinterpret_cast<int*>(this->temp_storage.ptr), c.st);
++            CUDA_CHECK(cudaGetLastError());
++            af_compress_components_kernel<<<c.grid_F, BLOCK_SIZE, 0, stream>>>(
++                reinterpret_cast<int*>(this->temp_storage.ptr), c.F, c.st);
++            CUDA_CHECK(cudaGetLastError());
++            af_uf_decide_kernel<<<1, 1, 0, stream>>>(c.st);
++            CUDA_CHECK(cudaGetLastError());
++        }
++        swap_buffers(this->atlas_chart_ids, this->temp_storage);
++        af_compress_ids(c, this->atlas_chart_ids.ptr, c.F, nullptr, c.st + CS_C, nullptr, stream);
++
++        af_global_iter_record_kernel<<<1, 1, 0, stream>>>(c.st, i);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    // H10: the single readback.
++    CUDA_CHECK(cudaMemcpyAsync(h_state.data(), c.st, c.num_state * sizeof(int), cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaFree(arena.base));
++
++    std::vector<int> stats(h_state.begin() + CS_SIZE, h_state.end());
++    for (int i = 0; i < global_iterations; i++) {
++        if (stats[CS_STATS_STRIDE * i + 1] != 1) {
++            TORCH_CHECK(false, "[CuMesh] compute_charts_sync_free: max_rounds=", max_rounds,
++                        " reached before the collapse loop converged in global iteration ", i,
++                        " (rounds executed=", stats[CS_STATS_STRIDE * i + 0], "); increase max_rounds "
++                        "(the caller may fall back to compute_charts(sync_free=False)).");
++        }
++        if (stats[CS_STATS_STRIDE * i + 3] != 1) {
++            TORCH_CHECK(false, "[CuMesh] compute_charts_sync_free: max_uf_passes=", max_uf_passes,
++                        " reached before the union-find converged in global iteration ", i,
++                        "; increase max_uf_passes (the caller may fall back to compute_charts(sync_free=False)).");
++        }
++    }
++
++    this->atlas_num_charts = h_state[CS_C];
++
++    // Finalizing: calculate vmap, chart face and chart face offset (original, host-synced, once)
++    construct_chart_mesh(*this, stream);
++
++    return stats;
++}
++
++
++} // namespace fastpixal3d_cumesh_ns
+diff --git a/src/connectivity.cu b/src/connectivity.cu
+index b47e05b..5aa8fce 100644
+--- a/src/connectivity.cu
++++ b/src/connectivity.cu
+@@ -92,6 +92,16 @@ void CuMesh::get_vertex_face_adjacency() {
+         this->vert2face_cnt.ptr
+     );
+     CUDA_CHECK(cudaGetLastError());
++    if (this->deterministic) {
++        // fastpixal3d_cumesh deterministic mode: fix the atomic (hardware-ordered)
++        // order of each vertex's face list. Consumers whose float sums or
++        // tie-breaks depend on this order: get_qem_kernel / the skinny term
++        // (simplify), get_edge_face_adjacency_kernel -> edge2face ->
++        // refine_charts_kernel's candidate order (compute_charts).
++        sort_csr_segments_kernel<int><<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
++            this->vert2face.ptr, this->vert2face_offset.ptr, V, nullptr, nullptr);
++        CUDA_CHECK(cudaGetLastError());
++    }
+ }
+ 
+ 
+diff --git a/src/cumesh.h b/src/cumesh.h
+index 7d18a09..38bee08 100644
+--- a/src/cumesh.h
++++ b/src/cumesh.h
+@@ -80,6 +80,16 @@ public:
+     Buffer<char> temp_storage;
+     Buffer<char> cub_temp_storage;
+ 
++    // Opt-in deterministic mode (fastpixal3d_cumesh): sort every vertex's face list
++    // after building it (get_vertex_face_adjacency) and use order-fixed
++    // chart-length/perimeter sums in get_chart_connectivity -- see
++    // src/atlas_det.cuh. Default false keeps the original behaviour bit for bit.
++    bool deterministic = false;
++    // fastpixal3d_cumesh instrumentation of the ORIGINAL compute_charts(): number of
++    // collapse-loop rounds per global iteration of the last call (read-only
++    // from Python as CuMesh.last_charts_rounds; no effect on results).
++    std::vector<int> last_charts_rounds;
++
+     CuMesh();
+ 
+     ~CuMesh();
+@@ -454,6 +464,85 @@ public:
+      */
+     std::tuple<int, int> simplify_step(float lambda_edge_length, float lambda_skinny, float threshold, bool timing=false);
+ 
++    /**
++     * Sync-free variant of the simplify() round loop (src/simplify_fast.cu):
++     * runs up to max_rounds edge-collapse rounds with the threshold
++     * escalation / target check made on-device; if sync_every > 0 the host
++     * polls the device done flag every sync_every rounds and stops early.
++     * Refreshes vertices/faces, destroys all connectivity caches.
++     *
++     * fastpixal3d_cumesh additions (all default to the plain behaviour;
++     * see the src/simplify_fast.cu header for what each changes):
++     * @param compact_edge_bits if true, pack the per-round (min,max) edge
++     *        sort key into 2*ceil(log2(V0+1)) bits instead of the fixed 64
++     *        (32/32), cutting cub::DeviceRadixSort's pass count -- same sort
++     *        order / same RLE grouping, bit-identical selection.
++     * @param ratio_thresh the "<1% removed -> escalate threshold" cutoff
++     *        (default: 1e-2, as in the Python loop).
++     * @param escalation_factor the threshold multiplier applied when the
++     *        ratio_thresh cutoff fires (default: 10.0, as in the Python loop).
++     * @param fuse_round_kernels if true, merge the per-round count-update
++     *        and threshold/termination-decision kernels (already strictly
++     *        sequential, same-thread state reads/writes) into one launch.
++     * @param use_cuda_graph if true, capture one round's kernel sequence
++     *        into a CUDA graph (fixed pointers/grid sizes for the whole
++     *        call) and replay it via cudaGraphLaunch instead of issuing
++     *        every kernel launch from the host each round; falls back to
++     *        the normal per-kernel loop if capture/instantiation fails.
++     */
++    std::vector<int> simplify_sync_free(
++        float lambda_edge_length,
++        float lambda_skinny,
++        double initial_thresh,
++        int target_num_faces,
++        int max_rounds,
++        int sync_every,
++        bool compact_edge_bits = false,
++        double ratio_thresh = 1e-2,
++        double escalation_factor = 10.0,
++        bool fuse_round_kernels = false,
++        bool use_cuda_graph = false
++    );
++
++    /**
++     * Sync-free variant of compute_charts() (src/atlas_fast.cu). Same
++     * parameters/semantics as compute_charts(), plus max_rounds (cap on the
++     * collapse rounds per global iteration), sync_every (host poll period
++     * for the collapse loop's done flag, 0 = never), max_uf_passes (cap on
++     * the union-find passes of reassign_chart_ids). Throws if a cap is hit
++     * before convergence. Refreshes the same atlas_* state as compute_charts().
++     * @return per global iteration: {collapse_rounds, collapse_converged,
++     *         union_find_passes, union_find_converged}, flattened.
++     */
++    // fastpixal3d_cumesh additions (default to the plain behaviour; see
++    // src/atlas_fast.cu's own header comment "CO1"-"CO3"):
++    // @param compact_chart_bits pack the per-round chart_adj sort key into
++    //        2*ceil(log2(C0+1)) bits instead of the fixed 64 (disabled
++    //        whenever CuMesh::deterministic is set); also narrows the two
++    //        plain-int sorts (face-by-chart-id, compress_ids) unconditionally.
++    // @param skip_collapse_cone_writeback skip the per-collapse chart-cone
++    //        merge inside af_collapse_edges_kernel -- provably dead in the
++    //        current call pattern (always overwritten by the next fresh
++    //        af_compute_chart_normal_cones call before ever being read; see
++    //        atlas_fast.cu header "CO2").
++    // @param fuse_round_kernels merge independent same-round kernel pairs
++    //        that touch disjoint arrays into one launch each (gather area+
++    //        normal together; init faces_ids+chart_offsets together).
++    std::vector<int> compute_charts_sync_free(
++        float threshold_cone_half_angle_rad,
++        int refine_iterations,
++        int global_iterations,
++        float smooth_strength,
++        float area_penalty_weight,
++        float perimeter_area_ratio_weight,
++        int max_rounds,
++        int sync_every,
++        int max_uf_passes,
++        bool compact_chart_bits = false,
++        bool skip_collapse_cone_writeback = false,
++        bool fuse_round_kernels = false
++    );
++
+ 
+     // Atlasing functions
+ 
+diff --git a/src/ext.cpp b/src/ext.cpp
+index 5bc8d16..6c914a5 100644
+--- a/src/ext.cpp
++++ b/src/ext.cpp
+@@ -1,16 +1,19 @@
+ #include <torch/extension.h>
++#include <pybind11/stl.h>
+ #include "hash/api.h"
+ #include "cumesh.h"
+ #include "remesh/api.h"
+ 
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+-    // Hash functions
+-    m.def("hashmap_insert_cuda", &fastpixal3d_cumesh_ns::hashmap_insert_cuda);
+-    m.def("hashmap_lookup_cuda", &fastpixal3d_cumesh_ns::hashmap_lookup_cuda);
+-    m.def("hashmap_insert_3d_cuda", &fastpixal3d_cumesh_ns::hashmap_insert_3d_cuda);
+-    m.def("hashmap_lookup_3d_cuda", &fastpixal3d_cumesh_ns::hashmap_lookup_3d_cuda);
+-    m.def("hashmap_insert_3d_idx_as_val_cuda", &fastpixal3d_cumesh_ns::hashmap_insert_3d_idx_as_val_cuda);
++    // Hash functions -- CUDA kernel launches on tensor args only, no Python
++    // objects touched anywhere in the implementation; safe to release the
++    // GIL for the whole call.
++    m.def("hashmap_insert_cuda", &fastpixal3d_cumesh_ns::hashmap_insert_cuda, py::call_guard<py::gil_scoped_release>());
++    m.def("hashmap_lookup_cuda", &fastpixal3d_cumesh_ns::hashmap_lookup_cuda, py::call_guard<py::gil_scoped_release>());
++    m.def("hashmap_insert_3d_cuda", &fastpixal3d_cumesh_ns::hashmap_insert_3d_cuda, py::call_guard<py::gil_scoped_release>());
++    m.def("hashmap_lookup_3d_cuda", &fastpixal3d_cumesh_ns::hashmap_lookup_3d_cuda, py::call_guard<py::gil_scoped_release>());
++    m.def("hashmap_insert_3d_idx_as_val_cuda", &fastpixal3d_cumesh_ns::hashmap_insert_3d_idx_as_val_cuda, py::call_guard<py::gil_scoped_release>());
+ 
+     /* CUMESH */
+     py::class_<fastpixal3d_cumesh_ns::CuMesh>(m, "CuMesh")
+@@ -23,46 +26,55 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("num_boundary_conneted_components", &fastpixal3d_cumesh_ns::CuMesh::num_boundary_conneted_components)
+         .def("num_boundary_loops", &fastpixal3d_cumesh_ns::CuMesh::num_boundary_loops)
+         .def("clear_cache", &fastpixal3d_cumesh_ns::CuMesh::clear_cache)
+-        .def("init", &fastpixal3d_cumesh_ns::CuMesh::init)
+-        .def("read", &fastpixal3d_cumesh_ns::CuMesh::read)
+-        .def("read_face_normals", &fastpixal3d_cumesh_ns::CuMesh::read_face_normals)
+-        .def("read_vertex_normals", &fastpixal3d_cumesh_ns::CuMesh::read_vertex_normals)
+-        .def("read_edges", &fastpixal3d_cumesh_ns::CuMesh::read_edges)
+-        .def("read_boundaries", &fastpixal3d_cumesh_ns::CuMesh::read_boundaries)
+-        .def("read_manifold_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::read_manifold_face_adjacency)
+-        .def("read_manifold_boundary_adjacency", &fastpixal3d_cumesh_ns::CuMesh::read_manifold_boundary_adjacency)
+-        .def("read_connected_components", &fastpixal3d_cumesh_ns::CuMesh::read_connected_components)
+-        .def("read_boundary_connected_components", &fastpixal3d_cumesh_ns::CuMesh::read_boundary_connected_components)
+-        .def("read_boundary_loops", &fastpixal3d_cumesh_ns::CuMesh::read_boundary_loops)
+-        .def("read_all_cache", &fastpixal3d_cumesh_ns::CuMesh::read_all_cache)
+-        .def("compute_face_normals", &fastpixal3d_cumesh_ns::CuMesh::compute_face_normals)
+-        .def("compute_vertex_normals", &fastpixal3d_cumesh_ns::CuMesh::compute_vertex_normals)
+-        .def("get_vertex_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_face_adjacency)
+-        .def("get_edges", &fastpixal3d_cumesh_ns::CuMesh::get_edges)
+-        .def("get_edge_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_edge_face_adjacency)
+-        .def("get_vertex_edge_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_edge_adjacency)
+-        .def("get_boundary_info", &fastpixal3d_cumesh_ns::CuMesh::get_boundary_info)
+-        .def("get_vertex_boundary_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_boundary_adjacency)
+-        .def("get_vertex_is_manifold", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_is_manifold)
+-        .def("get_manifold_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_manifold_face_adjacency)
+-        .def("get_manifold_boundary_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_manifold_boundary_adjacency)
+-        .def("get_connected_components", &fastpixal3d_cumesh_ns::CuMesh::get_connected_components)
+-        .def("get_boundary_connected_components", &fastpixal3d_cumesh_ns::CuMesh::get_boundary_connected_components)
+-        .def("get_boundary_loops", &fastpixal3d_cumesh_ns::CuMesh::get_boundary_loops)
+-        .def("remove_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_faces)
+-        .def("remove_unreferenced_vertices", &fastpixal3d_cumesh_ns::CuMesh::remove_unreferenced_vertices)
+-        .def("remove_duplicate_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_duplicate_faces)
+-        .def("remove_degenerate_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_degenerate_faces)
+-        .def("fill_holes", &fastpixal3d_cumesh_ns::CuMesh::fill_holes)
+-        .def("repair_non_manifold_edges", &fastpixal3d_cumesh_ns::CuMesh::repair_non_manifold_edges)
+-        .def("remove_non_manifold_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_non_manifold_faces)
+-        .def("remove_small_connected_components", &fastpixal3d_cumesh_ns::CuMesh::remove_small_connected_components)
+-        .def("unify_face_orientations", &fastpixal3d_cumesh_ns::CuMesh::unify_face_orientations)
+-        .def("simplify_step", &fastpixal3d_cumesh_ns::CuMesh::simplify_step)
+-        .def("compute_charts", &fastpixal3d_cumesh_ns::CuMesh::compute_charts)
+-        .def("read_atlas_charts", &fastpixal3d_cumesh_ns::CuMesh::read_atlas_charts);
++        .def_readwrite("deterministic", &fastpixal3d_cumesh_ns::CuMesh::deterministic)
++        .def_readonly("last_charts_rounds", &fastpixal3d_cumesh_ns::CuMesh::last_charts_rounds)
++        // Everything below launches CUDA kernels / CUB calls over
++        // torch::Tensor-backed device buffers only; no Python objects are
++        // touched (no "py::" token outside this file) -- safe to release the
++        // GIL for the whole call (return values are converted after the
++        // call_guard reacquires it).
++        .def("init", &fastpixal3d_cumesh_ns::CuMesh::init, py::call_guard<py::gil_scoped_release>())
++        .def("read", &fastpixal3d_cumesh_ns::CuMesh::read, py::call_guard<py::gil_scoped_release>())
++        .def("read_face_normals", &fastpixal3d_cumesh_ns::CuMesh::read_face_normals, py::call_guard<py::gil_scoped_release>())
++        .def("read_vertex_normals", &fastpixal3d_cumesh_ns::CuMesh::read_vertex_normals, py::call_guard<py::gil_scoped_release>())
++        .def("read_edges", &fastpixal3d_cumesh_ns::CuMesh::read_edges, py::call_guard<py::gil_scoped_release>())
++        .def("read_boundaries", &fastpixal3d_cumesh_ns::CuMesh::read_boundaries, py::call_guard<py::gil_scoped_release>())
++        .def("read_manifold_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::read_manifold_face_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("read_manifold_boundary_adjacency", &fastpixal3d_cumesh_ns::CuMesh::read_manifold_boundary_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("read_connected_components", &fastpixal3d_cumesh_ns::CuMesh::read_connected_components, py::call_guard<py::gil_scoped_release>())
++        .def("read_boundary_connected_components", &fastpixal3d_cumesh_ns::CuMesh::read_boundary_connected_components, py::call_guard<py::gil_scoped_release>())
++        .def("read_boundary_loops", &fastpixal3d_cumesh_ns::CuMesh::read_boundary_loops, py::call_guard<py::gil_scoped_release>())
++        .def("read_all_cache", &fastpixal3d_cumesh_ns::CuMesh::read_all_cache, py::call_guard<py::gil_scoped_release>())
++        .def("compute_face_normals", &fastpixal3d_cumesh_ns::CuMesh::compute_face_normals, py::call_guard<py::gil_scoped_release>())
++        .def("compute_face_areas", &fastpixal3d_cumesh_ns::CuMesh::compute_face_areas, py::call_guard<py::gil_scoped_release>())
++        .def("compute_vertex_normals", &fastpixal3d_cumesh_ns::CuMesh::compute_vertex_normals, py::call_guard<py::gil_scoped_release>())
++        .def("get_vertex_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_face_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("get_edges", &fastpixal3d_cumesh_ns::CuMesh::get_edges, py::call_guard<py::gil_scoped_release>())
++        .def("get_edge_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_edge_face_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("get_vertex_edge_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_edge_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("get_boundary_info", &fastpixal3d_cumesh_ns::CuMesh::get_boundary_info, py::call_guard<py::gil_scoped_release>())
++        .def("get_vertex_boundary_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_boundary_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("get_vertex_is_manifold", &fastpixal3d_cumesh_ns::CuMesh::get_vertex_is_manifold, py::call_guard<py::gil_scoped_release>())
++        .def("get_manifold_face_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_manifold_face_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("get_manifold_boundary_adjacency", &fastpixal3d_cumesh_ns::CuMesh::get_manifold_boundary_adjacency, py::call_guard<py::gil_scoped_release>())
++        .def("get_connected_components", &fastpixal3d_cumesh_ns::CuMesh::get_connected_components, py::call_guard<py::gil_scoped_release>())
++        .def("get_boundary_connected_components", &fastpixal3d_cumesh_ns::CuMesh::get_boundary_connected_components, py::call_guard<py::gil_scoped_release>())
++        .def("get_boundary_loops", &fastpixal3d_cumesh_ns::CuMesh::get_boundary_loops, py::call_guard<py::gil_scoped_release>())
++        .def("remove_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_faces, py::call_guard<py::gil_scoped_release>())
++        .def("remove_unreferenced_vertices", &fastpixal3d_cumesh_ns::CuMesh::remove_unreferenced_vertices, py::call_guard<py::gil_scoped_release>())
++        .def("remove_duplicate_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_duplicate_faces, py::call_guard<py::gil_scoped_release>())
++        .def("remove_degenerate_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_degenerate_faces, py::call_guard<py::gil_scoped_release>())
++        .def("fill_holes", &fastpixal3d_cumesh_ns::CuMesh::fill_holes, py::call_guard<py::gil_scoped_release>())
++        .def("repair_non_manifold_edges", &fastpixal3d_cumesh_ns::CuMesh::repair_non_manifold_edges, py::call_guard<py::gil_scoped_release>())
++        .def("remove_non_manifold_faces", &fastpixal3d_cumesh_ns::CuMesh::remove_non_manifold_faces, py::call_guard<py::gil_scoped_release>())
++        .def("remove_small_connected_components", &fastpixal3d_cumesh_ns::CuMesh::remove_small_connected_components, py::call_guard<py::gil_scoped_release>())
++        .def("unify_face_orientations", &fastpixal3d_cumesh_ns::CuMesh::unify_face_orientations, py::call_guard<py::gil_scoped_release>())
++        .def("simplify_step", &fastpixal3d_cumesh_ns::CuMesh::simplify_step, py::call_guard<py::gil_scoped_release>())
++        .def("simplify_sync_free", &fastpixal3d_cumesh_ns::CuMesh::simplify_sync_free, py::call_guard<py::gil_scoped_release>())
++        .def("compute_charts", &fastpixal3d_cumesh_ns::CuMesh::compute_charts, py::call_guard<py::gil_scoped_release>())
++        .def("compute_charts_sync_free", &fastpixal3d_cumesh_ns::CuMesh::compute_charts_sync_free, py::call_guard<py::gil_scoped_release>())
++        .def("read_atlas_charts", &fastpixal3d_cumesh_ns::CuMesh::read_atlas_charts, py::call_guard<py::gil_scoped_release>());
+ 
+-    // Remeshing functions
+-    m.def("get_sparse_voxel_grid_active_vertices", &fastpixal3d_cumesh_ns::get_sparse_voxel_grid_active_vertices);
+-    m.def("simple_dual_contour", &fastpixal3d_cumesh_ns::simple_dual_contour);
+-}
+\ No newline at end of file
++    m.def("get_sparse_voxel_grid_active_vertices", &fastpixal3d_cumesh_ns::get_sparse_voxel_grid_active_vertices, py::call_guard<py::gil_scoped_release>());
++    m.def("simple_dual_contour", &fastpixal3d_cumesh_ns::simple_dual_contour, py::call_guard<py::gil_scoped_release>());
++}
+diff --git a/src/shared.h b/src/shared.h
+index 7f321fc..95c3835 100644
+--- a/src/shared.h
++++ b/src/shared.h
+@@ -251,6 +251,32 @@ int compress_ids(T* ids, size_t N, Buffer<char>& cub_temp_storage, T* inverse=nu
+ }
+ 
+ 
++/**
++ * Deterministic mode helper (fastpixal3d_cumesh): sort each CSR segment
++ * [offsets[i], offsets[i+1]) ascending, in place (insertion sort; segments
++ * are short -- vertex valence). Optional device count / skip flag pointers
++ * for the sync-free paths (nullptr = unused).
++ */
++template<typename T>
++__global__ void sort_csr_segments_kernel(T* values, const int* offsets, const int N, const int* d_n, const int* d_skip) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= N) return;
++    if (d_skip != nullptr && *d_skip) return;
++    if (d_n != nullptr && tid >= *d_n) return;
++    const int b = offsets[tid];
++    const int e = offsets[tid + 1];
++    for (int i = b + 1; i < e; i++) {
++        T v = values[i];
++        int j = i - 1;
++        while (j >= b && values[j] > v) {
++            values[j + 1] = values[j];
++            j--;
++        }
++        values[j + 1] = v;
++    }
++}
++
++
+ // DEBUG
+ 
+ template <typename T>
+diff --git a/src/simplify_fast.cu b/src/simplify_fast.cu
+new file mode 100644
+index 0000000..21c5b78
+--- /dev/null
++++ b/src/simplify_fast.cu
+@@ -0,0 +1,1068 @@
++// simplify_fast.cu -- sync-free variant of CuMesh::simplify_step's round loop
++// (fastpixal3d_cumesh).
++//
++// CuMesh::simplify_sync_free() runs the ENTIRE round loop that cumesh.py's
++// `simplify()` drives from Python (one `simplify_step()` call per round, with
++// the "removed<1% -> thresh*=10" / "reached target -> stop" decision made in
++// Python between calls) as a single C++ call whose rounds are enqueued without
++// a host<->device round trip per round.
++//
++// ---------------------------------------------------------------------------
++// HOST DECISION POINTS IN THE ORIGINAL AND THEIR REPLACEMENTS
++//
++//  S1  cumesh.py simplify(): reads new_num_face (returned by simplify_step)
++//      and decides (a) new_num_face <= target -> stop, else (b)
++//      del_num_face / num_face < 1e-2 -> thresh *= 10 (Python doubles; the
++//      threshold is cast to float only when passed to simplify_step).
++//      -> sf_decision_kernel (1 thread) makes the same comparisons on the
++//         device-resident counters, in the same order, in DOUBLE precision
++//         (the ratio and the threshold escalation are double ops exactly like
++//         Python's; the collapse kernel casts the double threshold to float
++//         at the comparison, exactly like the Python->C++ float argument).
++//
++//  S2  connectivity.cu get_edges(): D2H read of RunLengthEncode's num_runs
++//      into edges.size (host grid size for all later per-edge kernels).
++//      -> sort + RLE run at the FIXED size E0 = 3*F0 (F0 = faces on entry,
++//         an upper bound: faces only decrease). The unused tail [3F, 3F0) is
++//         filled with a GHOST sentinel edge (GHOST, GHOST), GHOST = V0, which
++//         sorts after every real edge and collapses to exactly one trailing
++//         run whose multiplicity (3*(F0-F), a multiple of 3) can never be 1,
++//         so it is never a boundary edge; every per-edge kernel skips it.
++//         num_runs is written straight into the device state (STATE_NUM_EDGES)
++//         and every per-edge kernel is launched at grid=ceil(E0/BLOCK) and
++//         early-returns for tid >= *d_num_edges.
++//
++//  S3  connectivity.cu get_boundary_info(): D2H read of DeviceSelect::If's
++//      boundary count (host grid size for set_boundary_vertex_kernel).
++//      -> simplify only consumes vert_is_boundary (never the compacted
++//         `boundaries` list), so sf_mark_boundary_vertices_kernel flags an
++//         edge's endpoints iff its RLE multiplicity is exactly 1 -- the same
++//         predicate (is_boundary_edge) -- directly from the fixed-size arrays.
++//
++//  S4  simplify.cu collapse_edges(): two D2H reads of the ExclusiveSum
++//      totals (new vertex / face counts) to size the compacted outputs and
++//      the next round's host grid sizes.
++//      -> ping-pong buffers preallocated at V0/F0; the scans run at the fixed
++//         sizes V0+1/F0+1 over maps whose padding tail is 0 (sf_mark_valid_
++//         kernel), so the totals sit at the FIXED indices V0/F0 and are
++//         copied device-to-device into the state (sf_update_counts_kernel).
++//
++//  S5  shared.h Buffer<T>::free() (cudaStreamSynchronize + cudaFree) called
++//      ~10x per round by clear_cache(), Buffer<T>::fill() (host vector
++//      round trip + sync) in collapse_edges()/propagate_cost(), and the
++//      per-round cudaMalloc/cudaFree of get_edges()/get_boundary_info().
++//      -> one arena allocation for the whole call, fill via kernels,
++//         clear_cache() once after the loop.
++//
++//  S6  The while(true) itself: fixed `max_rounds` host loop; once
++//      STATE_DONE is set every round is a no-op. With `sync_every` > 0 the
++//      host polls the flag every sync_every rounds and stops early
++//      (bounding the wasted no-op rounds by sync_every-1); sync_every = 0
++//      is the pure fixed-round form. The final (V, F) is read back once.
++//
++// ---------------------------------------------------------------------------
++// CORRECTNESS NOTES (pitfalls of a naive sync-free loop and how they are avoided)
++//
++//  B1  Post-convergence rounds must be idempotent: sf_mark_valid_
++//      kernel and sf_collapse_edges_kernel were skipped once STATE_DONE was
++//      set, but the in-place cub::DeviceScan::ExclusiveSum on vertices_map/
++//      faces_map still ran every round, re-scanning an already-scanned array
++//      (values explode), and the unguarded compress kernels then indexed the
++//      pong buffers with those values (out of bounds -> illegal memory
++//      access); additionally swap_buffers() ran unconditionally on the host,
++//      so even without the OOB the mesh would have been swapped with stale
++//      pong data. Now: sf_mark_valid_kernel always runs (all-ones over the
++//      frozen [0,V)/[0,F) prefix), the collapse is skipped, so the scan is
++//      the identity map, the compress copies the frozen mesh into the pong
++//      unchanged, the swap is harmless, and the counts re-derive to the same
++//      values. Post-convergence rounds are true no-ops (and the derive-only
++//      kernels early-exit on the flag to make them cheaper).
++//
++//  B2  Threshold escalation was done in float on device (float(1e-8)*10.0f),
++//      whereas Python escalates a double and casts to float per call
++//      (float(1e-7)) -- these differ by an ulp for some steps, changing the
++//      `cost > thresh` comparison in rare cases. Now double, cast at use.
++//
++//  B3  The <1% ratio was computed in float; Python uses double. Now double.
++//
++//  B4  18 separate Buffer allocations (18 cudaMalloc + 18 synchronizing
++//      cudaFree per call) -> one arena.
++//
++// DETERMINISTIC MODE (CuMesh::deterministic, opt-in, both paths): the
++// original simplify is not run-to-run repeatable (measured: different final
++// face counts on every mesh tried) because fill_neighbor_face_ids_kernel's
++// atomicAdd slot assignment makes each vertex's face list hardware-ordered,
++// and get_qem_kernel / the skinny term sum floats in that order. With the
++// flag set, both paths sort every vertex's face list (shared.h
++// sort_csr_segments_kernel) right after building it; nothing else changes.
++// ---------------------------------------------------------------------------
++//
++// OPTIONAL SPEED-UPS (all four default to the plain sync-free behaviour; each
++// is independently switchable).
++//
++//  O1 compact_edge_bits -- S2's edge key is packed as (min_vid << 32) |
++//     max_vid and radix-sorted over the full 64 bits (0..63), even though a
++//     mesh's vertex count V0 (and GHOST=V0, the padding sentinel) almost
++//     always fits in far fewer than 32 bits: on the remesh ->
++//     simplify path the mesh entering simplify has O(1e5-1e6)
++//     vertices, needing ~17-21 bits, not 32. cub::DeviceRadixSort's Onesweep
++//     kernel issues one kernel launch per 8-bit digit pass, so sorting the
++//     full 64 bits costs 8 launches/round regardless of how few bits are
++//     actually live (a profile shows exactly 8 DeviceRadixSortOnesweepKernel
++//     launches per simplify round).
++//     With this flag, both the pack (sf_expand_edges_padded_kernel) and
++//     every unpack (sf_mark_boundary_vertices_kernel,
++//     sf_get_edge_collapse_cost_kernel, sf_propagate_cost_kernel,
++//     sf_collapse_edges_kernel -- ALL FOUR kernels that decode an edge's
++//     (e0,e1) from its packed key) use a dynamic key_shift = K = ceil(log2(V0+1)) bits
++//     per half (instead of the fixed 32), and the sort's end_bit narrows
++//     from 64 to 2*K. This is a
++//     REPACKING, not a truncation: for any V0, the map (min,max) -> (min<<K)
++//     | max is injective (both halves fit in K bits by construction) and
++//     strictly order-preserving in the same lexicographic (min,max) sense
++//     the original (min<<32)|max encoding already used -- the sort produces
++//     the IDENTICAL partition into unique edges, the IDENTICAL RLE run
++//     structure/multiplicities, and therefore an IDENTICAL boundary/interior
++//     classification and edge list order to the fixed-64-bit encoding. K is
++//     computed once per simplify_sync_free() call (host-side, from the
++//     already-known V0 -- no extra device sync) and held fixed for every
++//     round of that call, exactly like V0/F0/E0 already are.
++//
++//  O2 ratio_thresh / escalation_factor -- sf_decision_kernel's "removed
++//     <1% of faces this round -> threshold *= 10" rule (S1) had both
++//     constants (1e-2, 10.0) hardcoded to match the Python loop's
++//     hardcoded values. Both are now call parameters (still defaulting to
++//     1e-2 / 10.0, i.e. byte-identical decisions when left at default). A
++//     more aggressive ramp (higher escalation_factor and/or higher
++//     ratio_thresh) makes the per-round accepted threshold grow faster,
++//     which -- through the SAME cost<=threshold acceptance rule (unchanged)
++//     and the SAME conflict-free per-face-argmin batch selection (unchanged)
++//     -- tends to admit a larger accepted-collapse batch per round and reach
++//     target_num_faces in fewer total rounds. This changes the ORDER/PATH of
++//     collapses (which edges end up in which round's batch) but not the
++//     collapse acceptance criterion itself -- the same kind of run-to-run
++//     difference the default (non-deterministic) mode already has.
++//
++//  O3 fuse_round_kernels -- sf_update_counts_kernel and sf_decision_kernel
++//     are two single-thread kernels that already run back-to-back at the
++//     end of every round with a strict data dependency (decision reads the
++//     counts update just wrote) and no other kernel in between. Fusing them
++//     into one sf_finish_round_kernel (literally the two kernel bodies
++//     concatenated, same reads/writes, same order) removes one kernel-
++//     launch's host overhead per round without changing any value computed
++//     -- a pure mechanical fusion, unlike O1/O2 it cannot change output even
++//     in principle.
++//
++//  O4 use_cuda_graph -- every kernel launched inside the round loop uses
++//     fixed device pointers (the arena) and fixed grid/block sizes for the
++//     whole call (V0/F0/E0 do not change; only the DATA in the buffers
++//     changes round to round), and none of them allocate memory (the arena
++//     and cub_temp are both sized and allocated once, before the loop) --
++//     exactly the condition CUDA graph capture needs. With this flag, one
++//     round's kernel sequence is captured once (cudaStreamBeginCapture /
++//     cudaStreamEndCapture on the current stream, capturing but NOT
++//     executing that first round) and replayed with cudaGraphLaunch for
++//     every round instead of re-issuing ~20 individual kernel launches from
++//     the host each time; the sync_every host poll is unchanged (still runs
++//     between graph launches at the same cadence). If capture or
++//     instantiation fails for any reason, this falls back to the normal
++//     per-kernel-launch loop for the whole call (logged via a thrown-and-
++//     caught exception path, not silently -- see the C++ body below).
++// ---------------------------------------------------------------------------
++
++#include "cumesh.h"
++#include "dtypes.cuh"
++#include "shared.h"
++#include <cub/cub.cuh>
++#include <ATen/cuda/CUDAGraph.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAStream.h>
++#include <algorithm>
++#include <exception>
++#include <limits>
++#include <vector>
++
++
++namespace fastpixal3d_cumesh_ns {
++
++namespace {
++
++enum {
++    STATE_NUM_VERTICES = 0,
++    STATE_NUM_FACES = 1,
++    STATE_PREV_NUM_FACES = 2,
++    STATE_DONE = 3,
++    STATE_NUM_EDGES = 4,   // RunLengthEncode's num_runs output (real unique edges + the ghost run, if any)
++    STATE_ROUNDS = 5,      // rounds that actually ran a collapse step
++    STATE_SIZE = 6,
++};
++
++
++// O1: smallest K such that (1<<K) > n, i.e. every value in [0, n] (n itself
++// included -- the GHOST sentinel is set to V0) fits in K bits, ROUNDED UP to
++// a multiple of 4 so the sort's end_bit (2*K) is always a multiple of 8 -- a
++// whole number of cub::DeviceRadixSort's 8-bit digit passes, matching every
++// other end_bit this codebase already exercises (0 or 64). Kept as a
++// defensive, convention-matching margin: whether a non-multiple-of-8 end_bit is
++// safe on every CUB version has not been verified. Host-only, computed
++// once per simplify_sync_free() call from V0.
++inline int sf_bits_needed(int n) {
++    int k = 1;
++    while ((int64_t(1) << k) <= int64_t(n)) k++;
++    return (k + 3) & ~3;
++}
++
++
++__device__ inline uint64_t sf_pack_key_value_positive(int key, float value) {
++    unsigned int v = __float_as_uint(value);
++    return (static_cast<uint64_t>(v) << 32) | static_cast<unsigned int>(key);
++}
++
++
++// Mirrors process_incident_tri() in simplify.cu exactly.
++__device__ inline bool sf_process_incident_tri(
++    int tri_idx,
++    int collapse_keep_vert,
++    int collapse_other_vert,
++    const float3* vertices,
++    const int3* faces,
++    const Vec3f& v_new,
++    float& skinny_cost,
++    int& num_tri
++) {
++    const float EPS = 1e-12f;
++    int3 f_vids = faces[tri_idx];
++
++    if (f_vids.x == collapse_other_vert || f_vids.y == collapse_other_vert || f_vids.z == collapse_other_vert)
++        return true;
++
++    Vec3f a(vertices[f_vids.x]);
++    Vec3f b(vertices[f_vids.y]);
++    Vec3f c(vertices[f_vids.z]);
++
++    Vec3f na = (f_vids.x == collapse_keep_vert) ? v_new : a;
++    Vec3f nb = (f_vids.y == collapse_keep_vert) ? v_new : b;
++    Vec3f nc = (f_vids.z == collapse_keep_vert) ? v_new : c;
++
++    Vec3f old_e1 = b - a;
++    Vec3f old_e2 = c - a;
++    Vec3f old_normal = old_e1.cross(old_e2);
++    float old_area = 0.5f * old_normal.norm();
++    (void)old_area;
++
++    Vec3f new_e1 = nb - na;
++    Vec3f new_e2 = nc - na;
++    Vec3f new_normal = new_e1.cross(new_e2);
++    float new_area = 0.5f * new_normal.norm();
++
++    if (old_normal.dot(new_normal) < 0.0f) {
++        return false;
++    }
++
++    Vec3f new_e0 = nc - nb;
++    float denom = new_e0.norm2() + new_e1.norm2() + new_e2.norm2();
++    if (denom < EPS) denom = EPS;
++    float shapeMetric = 4.0f * sqrtf(3.0f) * new_area / denom;
++    float term = 1.0f - fminf(fmaxf(shapeMetric, 0.0f), 1.0f);
++    skinny_cost += term;
++    num_tri += 1;
++    return true;
++}
++
++
++__global__ void sf_init_state_kernel(int* state_i, double* state_d, int V0, int F0, double thresh0) {
++    state_i[STATE_NUM_VERTICES] = V0;
++    state_i[STATE_NUM_FACES] = F0;
++    state_i[STATE_PREV_NUM_FACES] = F0;
++    state_i[STATE_DONE] = 0;
++    state_i[STATE_NUM_EDGES] = 0;
++    state_i[STATE_ROUNDS] = 0;
++    state_d[0] = thresh0;
++}
++
++
++__global__ void sf_round_begin_kernel(int* state_i) {
++    if (state_i[STATE_DONE]) return;
++    state_i[STATE_PREV_NUM_FACES] = state_i[STATE_NUM_FACES];
++    state_i[STATE_ROUNDS] += 1;
++}
++
++
++// S1: the Python while-loop's termination check and "<1% -> thresh*=10" rule.
++// O2: ratio_thresh/escalation_factor are call parameters (default 1e-2/10.0,
++// i.e. identical decisions to the original hardcoded constants).
++__global__ void sf_decision_kernel(
++    int* state_i, double* state_d, int target_num_faces, double ratio_thresh, double escalation_factor
++) {
++    if (state_i[STATE_DONE]) return;
++    int new_f = state_i[STATE_NUM_FACES];
++    if (new_f <= target_num_faces) {
++        state_i[STATE_DONE] = 1;
++        return;
++    }
++    int prev_f = state_i[STATE_PREV_NUM_FACES];
++    int del_f = prev_f - new_f;
++    if ((double)del_f / (double)prev_f < ratio_thresh) {
++        state_d[0] = state_d[0] * escalation_factor;
++    }
++}
++
++
++// O3: sf_update_counts_kernel + sf_decision_kernel fused (see header "O3").
++__global__ void sf_finish_round_kernel(
++    int* state_i, const int* vertices_map_scanned, const int* faces_map_scanned, int V0, int F0,
++    double* state_d, int target_num_faces, double ratio_thresh, double escalation_factor
++) {
++    state_i[STATE_NUM_VERTICES] = vertices_map_scanned[V0];
++    state_i[STATE_NUM_FACES] = faces_map_scanned[F0];
++
++    if (state_i[STATE_DONE]) return;
++    int new_f = state_i[STATE_NUM_FACES];
++    if (new_f <= target_num_faces) {
++        state_i[STATE_DONE] = 1;
++        return;
++    }
++    int prev_f = state_i[STATE_PREV_NUM_FACES];
++    int del_f = prev_f - new_f;
++    if ((double)del_f / (double)prev_f < ratio_thresh) {
++        state_d[0] = state_d[0] * escalation_factor;
++    }
++}
++
++
++__global__ void sf_get_neighbor_face_cnt_kernel(
++    const int3* faces, const int* d_num_faces, const int* d_done, int F0, int* neighbor_face_cnt
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F0) return;
++    if (*d_done) return;
++    if (tid >= *d_num_faces) return;
++    int3 f = faces[tid];
++    atomicAdd(&neighbor_face_cnt[f.x], 1);
++    atomicAdd(&neighbor_face_cnt[f.y], 1);
++    atomicAdd(&neighbor_face_cnt[f.z], 1);
++}
++
++
++__global__ void sf_fill_neighbor_face_ids_kernel(
++    const int3* faces, const int* d_num_faces, const int* d_done, int F0,
++    int* neighbor_face_ids, int* neighbor_face_ids_offset, int* neighbor_face_cnt
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F0) return;
++    if (*d_done) return;
++    if (tid >= *d_num_faces) return;
++    int3 f = faces[tid];
++    neighbor_face_ids[neighbor_face_ids_offset[f.x] + atomicAdd(&neighbor_face_cnt[f.x], 1)] = tid;
++    neighbor_face_ids[neighbor_face_ids_offset[f.y] + atomicAdd(&neighbor_face_cnt[f.y], 1)] = tid;
++    neighbor_face_ids[neighbor_face_ids_offset[f.z] + atomicAdd(&neighbor_face_cnt[f.z], 1)] = tid;
++}
++
++
++// expand_edges_kernel + ghost-sentinel padding (S2). O1: key_shift is 32
++// (fixed encoding) unless compact_edge_bits, in which case it's K =
++// ceil(log2(V0+1)) -- see header "O1"; either way the encoding is an
++// order-preserving injection, so the sort/RLE output is unaffected.
++__global__ void sf_expand_edges_padded_kernel(
++    const int3* faces, const int* d_num_faces, const int* d_done, int F0, int ghost_vid,
++    int key_shift, uint64_t* edges_raw
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F0) return;
++    if (*d_done) return;
++    int base = tid * 3;
++    if (tid < *d_num_faces) {
++        int3 f = faces[tid];
++        edges_raw[base + 0] = ((uint64_t)min(f.x, f.y) << key_shift) | (uint32_t)max(f.x, f.y);
++        edges_raw[base + 1] = ((uint64_t)min(f.y, f.z) << key_shift) | (uint32_t)max(f.y, f.z);
++        edges_raw[base + 2] = ((uint64_t)min(f.z, f.x) << key_shift) | (uint32_t)max(f.z, f.x);
++    } else {
++        uint64_t sentinel = ((uint64_t)(uint32_t)ghost_vid << key_shift) | (uint32_t)ghost_vid;
++        edges_raw[base + 0] = sentinel;
++        edges_raw[base + 1] = sentinel;
++        edges_raw[base + 2] = sentinel;
++    }
++}
++
++
++// S3: boundary vertices straight from the RLE multiplicity.
++__global__ void sf_mark_boundary_vertices_kernel(
++    const uint64_t* edges, const int* edge_multiplicity, const int* d_num_edges, const int* d_done, int E0,
++    int ghost_vid, int key_shift, uint64_t key_mask, uint8_t* vert_is_boundary
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= E0) return;
++    if (*d_done) return;
++    if (tid >= *d_num_edges) return;
++    if (edge_multiplicity[tid] != 1) return;
++    uint64_t e = edges[tid];
++    int e0 = int(e >> key_shift);
++    int e1 = int(e & key_mask);
++    if (e0 == ghost_vid) return; // defensive; the ghost run's multiplicity is never 1
++    vert_is_boundary[e0] = 1;
++    vert_is_boundary[e1] = 1;
++}
++
++
++__global__ void sf_get_qem_kernel(
++    const float3* vertices, const int3* faces, const int* vert2face, const int* vert2face_offset,
++    const int* d_num_vertices, const int* d_done, int V0, QEM* qems
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= V0) return;
++    if (*d_done) return;
++    if (tid >= *d_num_vertices) return;
++    QEM v_qem;
++    for (int f = vert2face_offset[tid]; f < vert2face_offset[tid + 1]; f++) {
++        int3 f_vids = faces[vert2face[f]];
++        Vec3f f_v0(vertices[f_vids.x]);
++        Vec3f e1(vertices[f_vids.y]);
++        Vec3f e2(vertices[f_vids.z]);
++        e1 -= f_v0;
++        e2 -= f_v0;
++        Vec3f n = e1.cross(e2);
++        n.normalize();
++        float d = -(n.dot(f_v0));
++        v_qem.add_plane({ n.x, n.y, n.z, d });
++    }
++    qems[tid] = v_qem;
++}
++
++
++__global__ void sf_get_edge_collapse_cost_kernel(
++    const float3* vertices, const int3* faces,
++    const int* vert2face, const int* vert2face_offset,
++    const uint64_t* edges, const uint8_t* vert_is_boundary, const QEM* qems,
++    const int* d_num_edges, const int* d_done, int E0, int ghost_vid,
++    int key_shift, uint64_t key_mask,
++    const float lambda_edge_length, const float lambda_skinny,
++    float* edge_collapse_costs
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= E0) return;
++    if (*d_done) return;
++    if (tid >= *d_num_edges) return;
++
++    // get edge
++    uint64_t e = edges[tid];
++    int e0 = int(e >> key_shift);
++    int e1 = int(e & key_mask);
++    if (e0 == ghost_vid) return;
++
++    // get edge vertices
++    Vec3f v0(vertices[e0]);
++    Vec3f v1(vertices[e1]);
++    uint8_t v0_is_bound = vert_is_boundary[e0];
++    uint8_t v1_is_bound = vert_is_boundary[e1];
++    float w0 = 0.5;
++    if (v0_is_bound && !v1_is_bound) w0 = 1.0;
++    else if (!v0_is_bound &&  v1_is_bound) w0 = 0.0;
++    Vec3f v = v0 * w0 + v1 * (1.0f - w0);
++
++    float cost = 0.0f;
++
++    // QEM cost
++    QEM edge_qem = qems[e0] + qems[e1];
++    float qem_cost = edge_qem.evaluate(v);
++    cost += qem_cost;
++
++    // edge length cost
++    float edge_length2 = (v1 - v0).norm2();
++    cost += lambda_edge_length * edge_length2;
++
++    // skinny cost
++    float skinny_cost = 0.0f;
++    int num_tri = 0;
++    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
++        int tri_idx = vert2face[f];
++        if (!sf_process_incident_tri(tri_idx, e0, e1, vertices, faces, v, skinny_cost, num_tri)) {
++            edge_collapse_costs[tid] = INFINITY;
++            return;
++        }
++    }
++    for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
++        int tri_idx = vert2face[f];
++        if (!sf_process_incident_tri(tri_idx, e1, e0, vertices, faces, v, skinny_cost, num_tri)) {
++            edge_collapse_costs[tid] = INFINITY;
++            return;
++        }
++    }
++    if (num_tri > 0) {
++        skinny_cost /= num_tri;
++    }
++    cost += lambda_skinny * skinny_cost * edge_length2;
++
++    edge_collapse_costs[tid] = cost;
++}
++
++
++__global__ void sf_propagate_cost_kernel(
++    const uint64_t* edges, const int* vert2face, const int* vert2face_offset,
++    const float* edge_collapse_costs, const int* d_num_edges, const int* d_done, int E0, int ghost_vid,
++    int key_shift, uint64_t key_mask,
++    uint64_t* propagated_costs
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= E0) return;
++    if (*d_done) return;
++    if (tid >= *d_num_edges) return;
++
++    // get edge
++    uint64_t e = edges[tid];
++    int e0 = int(e >> key_shift);
++    int e1 = int(e & key_mask);
++    if (e0 == ghost_vid) return;
++
++    uint64_t cost = sf_pack_key_value_positive(tid, edge_collapse_costs[tid]);
++
++    // propagate cost to neighboring faces
++    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
++        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
++    }
++    for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
++        atomicMin(reinterpret_cast<unsigned long long*>(&propagated_costs[vert2face[f]]), static_cast<unsigned long long>(cost));
++    }
++}
++
++
++// S4: fixed-size replacement for `fill(1)`: 1 for the real prefix, 0 for the
++// padding tail. NOT guarded by the done flag (B1): after convergence it
++// re-derives the identity map every round.
++__global__ void sf_mark_valid_kernel(int* map, const int* d_count, int N) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid > N) return; // map has N+1 slots: [0, N]
++    map[tid] = (tid < *d_count) ? 1 : 0;
++}
++
++
++__global__ void sf_collapse_edges_kernel(
++    float3* vertices, int3* faces, const uint64_t* edges,
++    const int* vert2face, const int* vert2face_offset,
++    const float* edge_collapse_costs, const uint64_t* propagated_costs,
++    const uint8_t* vert_is_boundary,
++    const int* d_num_edges, int E0, int ghost_vid,
++    int key_shift, uint64_t key_mask,
++    const double* d_thresh, const int* d_done,
++    int* vertices_kept, int* faces_kept
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= E0) return;
++    if (*d_done) return;
++    if (tid >= *d_num_edges) return;
++
++    // get edge
++    uint64_t e = edges[tid];
++    int e0 = int(e >> key_shift);
++    int e1 = int(e & key_mask);
++    if (e0 == ghost_vid) return;
++
++    // B2: the double threshold is cast to float exactly like the Python
++    // double -> C++ float argument of simplify_step().
++    const float collapse_thresh = static_cast<float>(*d_thresh);
++    float cost = edge_collapse_costs[tid];
++    if (cost > collapse_thresh) return;
++
++    uint64_t pack = sf_pack_key_value_positive(tid, cost);
++
++    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
++        if (propagated_costs[vert2face[f]] != pack) return;
++    }
++    for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
++        if (propagated_costs[vert2face[f]] != pack) return;
++    }
++
++    // collapse edge
++    Vec3f v0(vertices[e0]);
++    Vec3f v1(vertices[e1]);
++    uint8_t v0_is_bound = vert_is_boundary[e0];
++    uint8_t v1_is_bound = vert_is_boundary[e1];
++    float w0 = 0.5;
++    if (v0_is_bound && !v1_is_bound) w0 = 1.0;
++    else if (!v0_is_bound &&  v1_is_bound) w0 = 0.0;
++    Vec3f v_new = v0 * w0 + v1 * (1.0f - w0);
++    vertices[e0] = { v_new.x, v_new.y, v_new.z };
++    vertices_kept[e1] = 0;
++    // delete shared faces
++    for (int f = vert2face_offset[e0]; f < vert2face_offset[e0+1]; f++) {
++        int fid = vert2face[f];
++        int3 f_vids = faces[fid];
++        if (f_vids.x == e1 || f_vids.y == e1 || f_vids.z == e1) {
++            faces_kept[fid] = 0;
++        }
++    }
++    // update faces
++    for (int f = vert2face_offset[e1]; f < vert2face_offset[e1+1]; f++) {
++        int fid = vert2face[f];
++        int3 f_vids = faces[fid];
++        if (f_vids.x == e1) {
++            f_vids.x = e0;
++        } else if (f_vids.y == e1) {
++            f_vids.y = e0;
++        } else if (f_vids.z == e1) {
++            f_vids.z = e0;
++        }
++        faces[fid] = f_vids;
++    }
++}
++
++
++__global__ void sf_compress_vertices_kernel(
++    const int* vertices_map_scanned, const float3* old_vertices, const int* d_num_vertices_old, int V0,
++    float3* new_vertices
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= V0) return;
++    if (tid >= *d_num_vertices_old) return;
++    int new_id = vertices_map_scanned[tid];
++    int is_kept = vertices_map_scanned[tid + 1] == new_id + 1;
++    if (is_kept) {
++        new_vertices[new_id] = old_vertices[tid];
++    }
++}
++
++
++__global__ void sf_compress_faces_kernel(
++    const int* faces_map_scanned, const int* vertices_map_scanned, const int3* old_faces,
++    const int* d_num_faces_old, int F0, int3* new_faces
++) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    if (tid >= F0) return;
++    if (tid >= *d_num_faces_old) return;
++    int new_id = faces_map_scanned[tid];
++    int is_kept = faces_map_scanned[tid + 1] == new_id + 1;
++    if (is_kept) {
++        new_faces[new_id].x = vertices_map_scanned[old_faces[tid].x];
++        new_faces[new_id].y = vertices_map_scanned[old_faces[tid].y];
++        new_faces[new_id].z = vertices_map_scanned[old_faces[tid].z];
++    }
++}
++
++
++// S4: device-to-device copy of the new counts from the fixed-index end of
++// the scanned maps.
++__global__ void sf_update_counts_kernel(
++    int* state_i, const int* vertices_map_scanned, const int* faces_map_scanned, int V0, int F0
++) {
++    state_i[STATE_NUM_VERTICES] = vertices_map_scanned[V0];
++    state_i[STATE_NUM_FACES] = faces_map_scanned[F0];
++}
++
++
++struct SfArena {
++    char* base = nullptr;
++    size_t offset = 0;
++    bool dry_run = true;
++
++    template<typename T>
++    T* take(size_t n) {
++        size_t bytes = n * sizeof(T);
++        bytes = (bytes + 255) & ~size_t(255);
++        T* p = dry_run ? nullptr : reinterpret_cast<T*>(base + offset);
++        offset += bytes;
++        return p;
++    }
++};
++
++
++struct SfCtx {
++    int V0 = 0, F0 = 0, E0 = 0;
++    int* state_i = nullptr;
++    double* state_d = nullptr;
++    int* vert2face_cnt = nullptr;     // V0 + 1
++    int* vert2face_offset = nullptr;  // V0 + 1
++    int* vert2face = nullptr;         // E0
++    uint64_t* edges_raw = nullptr;    // E0
++    uint64_t* edges_sorted = nullptr; // E0
++    uint64_t* edges = nullptr;        // E0 (RLE unique out)
++    int* edge_cnt = nullptr;          // E0 (RLE counts out)
++    uint8_t* vert_is_boundary = nullptr; // V0
++    QEM* qem = nullptr;               // V0
++    float* edge_cost = nullptr;       // E0
++    uint64_t* propagated = nullptr;   // F0
++    int* vertices_map = nullptr;      // V0 + 1
++    int* faces_map = nullptr;         // F0 + 1
++    float3* vertices_pong = nullptr;  // V0
++    int3* faces_pong = nullptr;       // F0
++    char* cub_temp = nullptr;
++    size_t cub_temp_bytes = 0;
++
++    void carve(SfArena& a) {
++        state_i = a.take<int>(STATE_SIZE);
++        state_d = a.take<double>(1);
++        vert2face_cnt = a.take<int>(V0 + 1);
++        vert2face_offset = a.take<int>(V0 + 1);
++        vert2face = a.take<int>(E0);
++        edges_raw = a.take<uint64_t>(E0);
++        edges_sorted = a.take<uint64_t>(E0);
++        edges = a.take<uint64_t>(E0);
++        edge_cnt = a.take<int>(E0);
++        vert_is_boundary = a.take<uint8_t>(V0);
++        qem = a.take<QEM>(V0);
++        edge_cost = a.take<float>(E0);
++        propagated = a.take<uint64_t>(F0);
++        vertices_map = a.take<int>(V0 + 1);
++        faces_map = a.take<int>(F0 + 1);
++        vertices_pong = a.take<float3>(V0);
++        faces_pong = a.take<int3>(F0);
++        cub_temp = a.take<char>(cub_temp_bytes);
++    }
++};
++
++
++// O1: end_bit is the actual bit range the runtime sort call will use (64
++// unless compact_edge_bits) -- sized for that range so the arena's cub_temp
++// is never under-allocated for a narrower (equal-or-smaller-temp) sort.
++size_t sf_query_cub_temp(SfCtx& c, cudaStream_t stream, int end_bit) {
++    size_t bytes, max_bytes = 0;
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, bytes, c.vert2face_cnt, c.vert2face_offset, c.V0 + 1, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceRadixSort::SortKeys(nullptr, bytes, c.edges_raw, c.edges_sorted, c.E0, 0, end_bit, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(nullptr, bytes, c.edges_sorted, c.edges, c.edge_cnt, c.state_i + STATE_NUM_EDGES, c.E0, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, bytes, c.vertices_map, c.V0 + 1, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    bytes = 0;
++    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, bytes, c.faces_map, c.F0 + 1, stream));
++    max_bytes = std::max(max_bytes, bytes);
++    return max_bytes;
++}
++
++} // anonymous namespace
++
++
++std::vector<int> CuMesh::simplify_sync_free(
++    float lambda_edge_length,
++    float lambda_skinny,
++    double initial_thresh,
++    int target_num_faces,
++    int max_rounds,
++    int sync_every,
++    bool compact_edge_bits,
++    double ratio_thresh,
++    double escalation_factor,
++    bool fuse_round_kernels,
++    bool use_cuda_graph
++) {
++    cudaStream_t stream = current_stream();
++
++    const int V0 = static_cast<int>(this->vertices.size);
++    const int F0 = static_cast<int>(this->faces.size);
++    if (F0 <= target_num_faces) {
++        return std::vector<int>{V0, F0, 0, 1};
++    }
++    TORCH_CHECK(max_rounds > 0, "[CuMesh] simplify_sync_free: max_rounds must be positive");
++    TORCH_CHECK(sync_every >= 0, "[CuMesh] simplify_sync_free: sync_every must be >= 0");
++    const int GHOST = V0;
++    const int E0 = F0 * 3;
++
++    // O1: key_shift/key_mask/end_bit for the (min,max) edge sort key -- see
++    // header "O1". compact_edge_bits=false reproduces the fixed 32/64
++    // encoding exactly (key_shift=32, key_mask=0xFFFFFFFF, end_bit=64).
++    const int key_shift = compact_edge_bits ? sf_bits_needed(V0) : 32;
++    const uint64_t key_mask = (key_shift >= 32) ? uint64_t(0xFFFFFFFFu) : ((uint64_t(1) << key_shift) - 1);
++    const int end_bit = compact_edge_bits ? 2 * key_shift : int(sizeof(uint64_t) * 8);
++
++    SfCtx c;
++    c.V0 = V0; c.F0 = F0; c.E0 = E0;
++
++    SfArena arena;
++    arena.dry_run = true;
++    c.cub_temp_bytes = 0;
++    c.carve(arena);
++    c.cub_temp_bytes = sf_query_cub_temp(c, stream, end_bit);
++    arena.offset = 0;
++    c.carve(arena);
++    const size_t total_bytes = arena.offset;
++    CUDA_CHECK(cudaMalloc(&arena.base, total_bytes));
++    arena.dry_run = false;
++    arena.offset = 0;
++    c.carve(arena);
++
++    const int grid_V0 = (V0 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    const int grid_V0p1 = (V0 + 1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    const int grid_F0 = (F0 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    const int grid_F0p1 = (F0 + 1 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++    const int grid_E0 = (E0 + BLOCK_SIZE - 1) / BLOCK_SIZE;
++
++    // Ping-pong partner for this->vertices / this->faces. The mesh buffers
++    // keep their capacity (>= V0/F0); their .size is fixed up at the end.
++    Buffer<float3> vertices_pong; vertices_pong.ptr = c.vertices_pong; vertices_pong.size = V0; vertices_pong.capacity = V0;
++    Buffer<int3> faces_pong; faces_pong.ptr = c.faces_pong; faces_pong.size = F0; faces_pong.capacity = F0;
++    // Remember which raw pointer belongs to the arena so we can put the
++    // mesh's own allocation back into this->vertices/faces at the end
++    // regardless of swap parity (the arena is freed here).
++    float3* mesh_vertices_ptr = this->vertices.ptr;
++    int3* mesh_faces_ptr = this->faces.ptr;
++    const size_t mesh_vertices_capacity = this->vertices.capacity;
++    const size_t mesh_faces_capacity = this->faces.capacity;
++
++    sf_init_state_kernel<<<1, 1, 0, stream>>>(c.state_i, c.state_d, V0, F0, initial_thresh);
++    CUDA_CHECK(cudaGetLastError());
++
++    const int* d_done = c.state_i + STATE_DONE;
++    const int* d_nv = c.state_i + STATE_NUM_VERTICES;
++    const int* d_nf = c.state_i + STATE_NUM_FACES;
++    const int* d_ne = c.state_i + STATE_NUM_EDGES;
++
++    // One round's kernel sequence, factored into a callable so it can be
++    // issued either directly (the plain path) or once, under
++    // stream capture, for O4 (use_cuda_graph). Every pointer/grid size it
++    // touches is fixed for the whole call (the arena, V0/F0/E0, this->
++    // vertices.ptr/this->faces.ptr -- note these two are swapped with the
++    // pong buffers INSIDE this lambda, which is fine even for a captured
++    // graph: the swap only exchanges which of the two ALREADY-CAPTURED
++    // pointers a later replay's kernels read/write via the closure's own
++    // `this` / `vertices_pong`/`faces_pong` references -- see the graph
++    // path below for why this still requires care).
++    auto run_round = [&]() {
++        // O4: re-fetch the current stream on every call rather than closing
++        // over the outer `stream` variable -- during graph capture this
++        // must be the dedicated capture-only pooled stream (see O4 below),
++        // never the shared stream the rest of this function/process uses;
++        // outside capture (the normal path, and at/after replay) torch's
++        // current stream is unchanged from the outer `stream`, so this is a
++        // no-op there. Shadows the outer `stream` for the rest of this
++        // lambda body -- every launch below already reads `stream` by name.
++        cudaStream_t stream = current_stream();
++        sf_round_begin_kernel<<<1, 1, 0, stream>>>(c.state_i);
++        CUDA_CHECK(cudaGetLastError());
++
++        // 1. vertex-face adjacency
++        CUDA_CHECK(cudaMemsetAsync(c.vert2face_cnt, 0, (V0 + 1) * sizeof(int), stream));
++        sf_get_neighbor_face_cnt_kernel<<<grid_F0, BLOCK_SIZE, 0, stream>>>(
++            this->faces.ptr, d_nf, d_done, F0, c.vert2face_cnt);
++        CUDA_CHECK(cudaGetLastError());
++        {
++            size_t bytes = c.cub_temp_bytes;
++            CUDA_CHECK(cub::DeviceScan::ExclusiveSum(c.cub_temp, bytes, c.vert2face_cnt, c.vert2face_offset, V0 + 1, stream));
++        }
++        CUDA_CHECK(cudaMemsetAsync(c.vert2face_cnt, 0, (V0 + 1) * sizeof(int), stream));
++        sf_fill_neighbor_face_ids_kernel<<<grid_F0, BLOCK_SIZE, 0, stream>>>(
++            this->faces.ptr, d_nf, d_done, F0, c.vert2face, c.vert2face_offset, c.vert2face_cnt);
++        CUDA_CHECK(cudaGetLastError());
++        if (this->deterministic) {
++            // DETERMINISTIC MODE: fix the (atomic, hardware-ordered) order of
++            // each vertex's face list -- the summation order of the QEM and
++            // skinny terms -- exactly like get_vertex_face_adjacency() does
++            // in the original path when CuMesh::deterministic is set.
++            sort_csr_segments_kernel<int><<<grid_V0, BLOCK_SIZE, 0, stream>>>(
++                c.vert2face, c.vert2face_offset, V0, d_nv, d_done);
++            CUDA_CHECK(cudaGetLastError());
++        }
++
++        // 2. edges: pad + sort + RLE, count stays on-device (S2, O1)
++        sf_expand_edges_padded_kernel<<<grid_F0, BLOCK_SIZE, 0, stream>>>(
++            this->faces.ptr, d_nf, d_done, F0, GHOST, key_shift, c.edges_raw);
++        CUDA_CHECK(cudaGetLastError());
++        {
++            size_t bytes = c.cub_temp_bytes;
++            CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
++                c.cub_temp, bytes, c.edges_raw, c.edges_sorted, E0, 0, end_bit, stream));
++        }
++        {
++            size_t bytes = c.cub_temp_bytes;
++            CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
++                c.cub_temp, bytes, c.edges_sorted, c.edges, c.edge_cnt, c.state_i + STATE_NUM_EDGES, E0, stream));
++        }
++
++        // 3. boundary vertices (S3)
++        CUDA_CHECK(cudaMemsetAsync(c.vert_is_boundary, 0, V0 * sizeof(uint8_t), stream));
++        sf_mark_boundary_vertices_kernel<<<grid_E0, BLOCK_SIZE, 0, stream>>>(
++            c.edges, c.edge_cnt, d_ne, d_done, E0, GHOST, key_shift, key_mask, c.vert_is_boundary);
++        CUDA_CHECK(cudaGetLastError());
++
++        // 4. QEM
++        sf_get_qem_kernel<<<grid_V0, BLOCK_SIZE, 0, stream>>>(
++            this->vertices.ptr, this->faces.ptr, c.vert2face, c.vert2face_offset, d_nv, d_done, V0, c.qem);
++        CUDA_CHECK(cudaGetLastError());
++
++        // 5. edge collapse cost
++        sf_get_edge_collapse_cost_kernel<<<grid_E0, BLOCK_SIZE, 0, stream>>>(
++            this->vertices.ptr, this->faces.ptr, c.vert2face, c.vert2face_offset,
++            c.edges, c.vert_is_boundary, c.qem, d_ne, d_done, E0, GHOST, key_shift, key_mask,
++            lambda_edge_length, lambda_skinny, c.edge_cost);
++        CUDA_CHECK(cudaGetLastError());
++
++        // 6. propagate cost
++        fill_kernel<uint64_t><<<grid_F0, BLOCK_SIZE, 0, stream>>>(
++            c.propagated, F0, std::numeric_limits<uint64_t>::max());
++        CUDA_CHECK(cudaGetLastError());
++        sf_propagate_cost_kernel<<<grid_E0, BLOCK_SIZE, 0, stream>>>(
++            c.edges, c.vert2face, c.vert2face_offset, c.edge_cost, d_ne, d_done, E0, GHOST, key_shift, key_mask, c.propagated);
++        CUDA_CHECK(cudaGetLastError());
++
++        // 7. valid maps (always), then collapse (skipped once done) -- B1
++        sf_mark_valid_kernel<<<grid_V0p1, BLOCK_SIZE, 0, stream>>>(c.vertices_map, d_nv, V0);
++        CUDA_CHECK(cudaGetLastError());
++        sf_mark_valid_kernel<<<grid_F0p1, BLOCK_SIZE, 0, stream>>>(c.faces_map, d_nf, F0);
++        CUDA_CHECK(cudaGetLastError());
++        sf_collapse_edges_kernel<<<grid_E0, BLOCK_SIZE, 0, stream>>>(
++            this->vertices.ptr, this->faces.ptr, c.edges, c.vert2face, c.vert2face_offset,
++            c.edge_cost, c.propagated, c.vert_is_boundary, d_ne, E0, GHOST, key_shift, key_mask,
++            c.state_d, d_done, c.vertices_map, c.faces_map);
++        CUDA_CHECK(cudaGetLastError());
++
++        // 8. compact (scan + compress); identity once done (S4, B1)
++        {
++            size_t bytes = c.cub_temp_bytes;
++            CUDA_CHECK(cub::DeviceScan::ExclusiveSum(c.cub_temp, bytes, c.vertices_map, V0 + 1, stream));
++        }
++        {
++            size_t bytes = c.cub_temp_bytes;
++            CUDA_CHECK(cub::DeviceScan::ExclusiveSum(c.cub_temp, bytes, c.faces_map, F0 + 1, stream));
++        }
++        sf_compress_vertices_kernel<<<grid_V0, BLOCK_SIZE, 0, stream>>>(
++            c.vertices_map, this->vertices.ptr, d_nv, V0, vertices_pong.ptr);
++        CUDA_CHECK(cudaGetLastError());
++        sf_compress_faces_kernel<<<grid_F0, BLOCK_SIZE, 0, stream>>>(
++            c.faces_map, c.vertices_map, this->faces.ptr, d_nf, F0, faces_pong.ptr);
++        CUDA_CHECK(cudaGetLastError());
++        swap_buffers(this->vertices, vertices_pong);
++        swap_buffers(this->faces, faces_pong);
++
++        // 9. counts update + threshold/termination decision (S4, S1, O3)
++        if (fuse_round_kernels) {
++            sf_finish_round_kernel<<<1, 1, 0, stream>>>(
++                c.state_i, c.vertices_map, c.faces_map, V0, F0, c.state_d, target_num_faces,
++                ratio_thresh, escalation_factor);
++            CUDA_CHECK(cudaGetLastError());
++        } else {
++            sf_update_counts_kernel<<<1, 1, 0, stream>>>(c.state_i, c.vertices_map, c.faces_map, V0, F0);
++            CUDA_CHECK(cudaGetLastError());
++            sf_decision_kernel<<<1, 1, 0, stream>>>(c.state_i, c.state_d, target_num_faces, ratio_thresh, escalation_factor);
++            CUDA_CHECK(cudaGetLastError());
++        }
++    };
++
++    // O4: capture one round into a graph and replay it instead of manually
++    // issuing every kernel launch each round -- see header "O4". Captured
++    // on a DEDICATED pooled stream (at::cuda::getStreamFromPool()), not the
++    // shared stream the rest of this call/process uses: capturing the
++    // shared stream directly hit "operation
++    // not permitted when stream is capturing" from unrelated CUDA activity
++    // on that same widely-shared stream (elsewhere in the process) racing
++    // the capture window; at::cuda::CUDAGraph::capture_begin()/capture_end()
++    // additionally coordinate with c10's CUDA caching allocator the way a
++    // raw cudaStreamBeginCapture does not. run_round() re-fetches "the
++    // current stream" itself (see its own comment) so its kernels land on
++    // whichever stream is current at each call -- the capture stream while
++    // inside the CUDAStreamGuard below, the original `stream` otherwise.
++    //
++    // IMPORTANT: run_round() swaps this->vertices/this->faces with
++    // vertices_pong/faces_pong (host-side pointer swap, not a device op)
++    // every time it runs; a captured graph's kernels are bound to whichever
++    // concrete device pointers were live at CAPTURE time and do not
++    // "follow" that swap on replay. Since there are only ever two physical
++    // buffers in play (the mesh's own allocation and the arena's pong), a
++    // graph captured while (vertices.ptr, pong.ptr) = (A, B) would, if
++    // replayed directly, keep reading/writing (A, B) every round instead of
++    // alternating (A,B),(B,A),(A,B),... -- silently wrong. This is handled
++    // by capturing TWO graphs (one per parity) and alternating which one is
++    // launched, so each graph always sees the pointer pair it was captured
++    // with; capture (which only records, never executes) is run for both
++    // parities back-to-back before any real round has executed.
++    bool graph_ok = false;
++    at::cuda::CUDAGraph graph_even, graph_odd;
++
++    if (use_cuda_graph) {
++        // Declared outside the try block (not inside) so the catch block
++        // below can still name it for cleanup -- a variable declared
++        // inside a try block is out of scope in its catch handler.
++        at::cuda::CUDAStream capture_stream = at::cuda::getStreamFromPool();
++        try {
++            {
++                c10::cuda::CUDAStreamGuard guard(capture_stream);
++                graph_even.capture_begin();
++                run_round();
++                graph_even.capture_end();
++                graph_odd.capture_begin();
++                run_round();
++                graph_odd.capture_end();
++            } // guard destructor restores the original current stream here
++            graph_ok = true;
++        } catch (const std::exception&) {
++            // Capture/instantiation failed: make sure capture_stream isn't
++            // left stuck mid-capture before falling back to the per-kernel-
++            // launch loop below for the whole call (note: by this point the
++            // CUDAStreamGuard above has already been destroyed during stack
++            // unwinding, restoring the current stream -- so check
++            // capture_stream explicitly here, not "the current stream").
++            // graph_even/graph_odd's own destructors clean up whatever
++            // cudaGraph_t/cudaGraphExec_t they did manage to build.
++            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
++            cudaStream_t cs = capture_stream.stream();
++            if (cudaStreamIsCapturing(cs, &capture_status) == cudaSuccess &&
++                capture_status != cudaStreamCaptureStatusNone) {
++                cudaGraph_t aborted = nullptr;
++                cudaStreamEndCapture(cs, &aborted);
++                if (aborted) cudaGraphDestroy(aborted);
++            }
++            graph_even.reset();
++            graph_odd.reset();
++            graph_ok = false;
++        }
++    }
++
++    if (use_cuda_graph && graph_ok) {
++        // The two capture calls above ran round 0's and round 1's kernel
++        // sequences for real (capture only records, it does not execute),
++        // so no rounds have actually happened on-device yet -- replay from
++        // round 0. CUDAGraph::replay() launches on the CURRENT stream,
++        // which at this point (outside the CUDAStreamGuard above) is back
++        // to the original `stream` -- confirmed by using `stream` directly
++        // for the sync_every poll in between replay() calls below.
++        for (int round = 0; round < max_rounds; round++) {
++            (round % 2 == 0 ? graph_even : graph_odd).replay();
++            if (sync_every > 0 && ((round + 1) % sync_every == 0) && (round + 1) < max_rounds) {
++                int h_done = 0;
++                CUDA_CHECK(cudaMemcpyAsync(&h_done, d_done, sizeof(int), cudaMemcpyDeviceToHost, stream));
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                if (h_done) break;
++            }
++        }
++    } else {
++        for (int round = 0; round < max_rounds; round++) {
++            run_round();
++            if (sync_every > 0 && ((round + 1) % sync_every == 0) && (round + 1) < max_rounds) {
++                int h_done = 0;
++                CUDA_CHECK(cudaMemcpyAsync(&h_done, d_done, sizeof(int), cudaMemcpyDeviceToHost, stream));
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                if (h_done) break;
++            }
++        }
++    }
++
++    // Make sure the mesh's own allocation ends up holding the result (the
++    // arena's pong is freed below): if the last swap left the result in the
++    // arena buffer, copy it back into the mesh buffer.
++    if (this->vertices.ptr != mesh_vertices_ptr) {
++        CUDA_CHECK(cudaMemcpyAsync(mesh_vertices_ptr, this->vertices.ptr, (size_t)V0 * sizeof(float3), cudaMemcpyDeviceToDevice, stream));
++        this->vertices.ptr = mesh_vertices_ptr;
++        this->vertices.capacity = mesh_vertices_capacity;
++    }
++    if (this->faces.ptr != mesh_faces_ptr) {
++        CUDA_CHECK(cudaMemcpyAsync(mesh_faces_ptr, this->faces.ptr, (size_t)F0 * sizeof(int3), cudaMemcpyDeviceToDevice, stream));
++        this->faces.ptr = mesh_faces_ptr;
++        this->faces.capacity = mesh_faces_capacity;
++    }
++
++    // single D2H readback for the whole call
++    int h_state[STATE_SIZE];
++    CUDA_CHECK(cudaMemcpyAsync(h_state, c.state_i, STATE_SIZE * sizeof(int), cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaFree(arena.base));
++
++    this->vertices.size = h_state[STATE_NUM_VERTICES];
++    this->faces.size = h_state[STATE_NUM_FACES];
++    this->clear_cache();
++
++    return std::vector<int>{h_state[STATE_NUM_VERTICES], h_state[STATE_NUM_FACES], h_state[STATE_ROUNDS], h_state[STATE_DONE]};
++}
++
++
++} // namespace fastpixal3d_cumesh_ns

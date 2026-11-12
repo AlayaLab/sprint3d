@@ -1,0 +1,46 @@
+{
+  "format": 1,
+  "note": "Upstream code and weights of the external methods at the commits and revisions of the report's runs. Nothing listed here is distributed with this repository.",
+  "methods": {
+    "trellis2": {
+      "display": "TRELLIS.2",
+      "adapter": "experiments/baselines/run_trellis2.py (and experiments/trellis2_mesh_path/)",
+      "code": {"repo": "https://github.com/microsoft/TRELLIS.2", "commit": "75fbf0183001ed9876c8dbb35de6b68552ee08bd", "licence": "MIT"},
+      "packages": [
+        {"name": "o_voxel", "repo": "https://github.com/microsoft/TRELLIS.2", "commit": "de38fdd4082638cb4e6d2285f2e215280bd3f485", "path": "o-voxel", "licence": "MIT", "note": "installed by env/install.sh; o_voxel/postprocess.py is identical at both commits"}
+      ],
+      "weights": [
+        {"repo": "microsoft/TRELLIS.2-4B", "revision": "af44b45f2e35a493886929c6d786e563ec68364d", "licence": "MIT"},
+        {"repo": "microsoft/TRELLIS-image-large", "revision": "25e0d31ffbebe4b5a97464dd851910efc3002d96", "files": "ckpts/ss_dec_conv3d_16l8_fp16.*", "licence": "see the model card", "note": "sparse-structure decoder, loaded by TRELLIS.2's pipeline.json"},
+        {"repo": "facebook/dinov3-vitl16-pretrain-lvd1689m", "revision": "ea8dc2863c51be0a264bab82070e3e8836b02d51", "licence": "DINOv3 License", "access": "gated"},
+        {"repo": "briaai/RMBG-2.0", "revision": "5df4c9c76d8170882c34f6986e848ee07fd0ba43", "licence": "CC BY-NC 4.0", "access": "gated", "note": "background removal; loaded with the pipeline, applied only to inputs without an alpha channel"}
+      ],
+      "settings": {"pipeline_type": "1024_cascade", "seed": 42, "simplify_before_export": 16777216, "export": {"decimation_target": 1000000, "texture_size": 4096, "remesh": true, "remesh_band": 1, "remesh_project": 0, "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], "textures": "PNG"}},
+      "environment": "this package's environment (env/install.sh); no further packages"
+    },
+    "triposg": {
+      "display": "TripoSG",
+      "adapter": "experiments/baselines/run_triposg.py",
+      "code": {"repo": "https://github.com/VAST-AI-Research/TripoSG", "commit": "fc5c40990181e2a756c4e0b1c2f4d6b5202faf8c", "licence": "MIT, with a NOTICE: code derived from HunyuanDiT and FlashVDM (Tencent Hunyuan community licences), RMBG (bria-rmbg-1.4), Diffusers (Apache-2.0)"},
+      "weights": [
+        {"repo": "VAST-AI/TripoSG", "revision": "2c1c516d22d58db486a058d98d31bb6177344e06", "licence": "MIT"},
+        {"repo": "briaai/RMBG-1.4", "revision": "2ceba5a5efaec153162aedea169f76caf9b46cf8", "licence": "bria-rmbg-1.4 (non-commercial)", "note": "background removal, used only for inputs without a usable alpha channel"}
+      ],
+      "settings": {"num_inference_steps": 50, "guidance_scale": 7.0, "dtype": "float16", "seed": 42, "faces": -1, "geometry": "pipeline defaults (flash decoder, octree depth 9, bounds 1.005)"},
+      "environment": "a virtual environment on top of this package's environment with diso 0.1.4 (built from source; CC BY-NC 4.0), scikit-image 0.25.2, peft 0.21.0, jaxtyping 0.3.7, typeguard 4.6.0"
+    },
+    "hunyuan3d21": {
+      "display": "Hunyuan3D-2.1",
+      "optional": true,
+      "adapter": "experiments/baselines/run_hunyuan3d21.py",
+      "code": {"repo": "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1", "commit": "82920d643c0dc2f7bfd7255f45f62d386edfe60c", "licence": "Tencent Hunyuan 3D 2.1 Community License Agreement (not applicable in the European Union, the United Kingdom and South Korea)"},
+      "weights": [
+        {"repo": "tencent/Hunyuan3D-2.1", "revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327", "licence": "Tencent Hunyuan 3D 2.1 Community License Agreement"},
+        {"repo": "facebook/dinov2-giant", "revision": "611a9d42f2335e0f921f1e313ad3c1b7178d206d", "licence": "Apache-2.0"},
+        {"url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth", "sha256": "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1", "licence": "BSD-3-Clause (Real-ESRGAN)"}
+      ],
+      "settings": {"max_num_view": 6, "resolution": 512, "seed": 42, "shape": "Hunyuan3DDiTFlowMatchingPipeline.__call__ defaults", "paint": "Hunyuan3DPaintConfig defaults (remesh to 40,000 faces, render 2048, texture 4096)"},
+      "environment": "a virtual environment on top of this package's environment with transformers 4.46.0, diffusers 0.30.0, huggingface-hub 0.30.2, trimesh 4.4.7, numpy 2.2.6, realesrgan 0.3.0, basicsr 1.4.2, pymeshlab, xatlas, pygltflib, rembg, onnxruntime, cupy-cuda12x, pytorch-lightning, torchmetrics, timm, torchdiffeq, scikit-image, pybind11, fast_simplification, and the two extensions of the checkout (hy3dpaint/custom_rasterizer, hy3dpaint/DifferentiableRenderer); Blender's bpy is optional"
+    }
+  }
+}

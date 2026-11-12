@@ -1,0 +1,11 @@
+# Paper row: + side-stream texture sampling, early PNG
+# Cumulative measurement, row 13 of 00-18 (file order = order of the measurement); block: flow engineering
+# (rows 09-13).
+# End of the flow engineering block (the report's '+ flow optimizations').
+name: texture_side_stream
+method: fast
+block: flow_engineering
+adds: [texture_side_stream]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, adaptive_remesh,
+  lean_glb_writer, gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers,
+  fa3_texture_flow, texture_kv_reuse, shared_conditioning, fa3_fine_shape_flow, texture_side_stream]

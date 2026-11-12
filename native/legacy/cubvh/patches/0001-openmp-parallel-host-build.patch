@@ -1,0 +1,297 @@
+diff --git a/setup.py b/setup.py
+index 0b63391..3022916 100644
+--- a/setup.py
++++ b/setup.py
+@@ -42,10 +42,16 @@ base_nvcc_flags = [
+ ]
+ 
+ if os.name == "posix":
+-	base_cflags = ["-O3", f"-std=c++{cpp_standard}"]
++	# -fvisibility=hidden: pybind11's recommended setting so this module's C++ type
++	# registrations (e.g. cuBVH) stay module-local and never get folded together with an
++	# identically-named type in another extension (e.g. the installed cumesh's _cubvh)
++	# by the dynamic linker -- see https://pybind11.readthedocs.io/en/stable/faq.html.
++	base_cflags = ["-O3", f"-std=c++{cpp_standard}", "-fopenmp", "-fvisibility=hidden"]
+ 	base_nvcc_flags += [
+ 		"-Xcompiler=-Wno-float-conversion",
+ 		"-Xcompiler=-fno-strict-aliasing",
++		"-Xcompiler=-fopenmp",
++		"-Xcompiler=-fvisibility=hidden",
+ 	]
+ elif os.name == "nt":
+ 	base_cflags = ["/O2", f"/std:c++{cpp_standard}"]
+@@ -74,7 +80,8 @@ setup(
+ 			extra_compile_args={
+ 				'cxx': base_cflags,
+ 				'nvcc': base_nvcc_flags,
+-			}
++			},
++			extra_link_args=['-fopenmp'],
+ 		),
+ 	],
+ 	cmdclass={
+diff --git a/src/api_gpu.cu b/src/api_gpu.cu
+index 3e02834..661ec37 100644
+--- a/src/api_gpu.cu
++++ b/src/api_gpu.cu
+@@ -26,6 +26,10 @@ public:
+ 
+         triangles_cpu.resize(n_triangles);
+ 
++        // Trivially parallel: each iteration only reads its own row(s) of the (shared,
++        // read-only) vertices/triangles inputs and writes its own triangles_cpu[i] --
++        // no cross-iteration dependency, so the result is independent of thread scheduling.
++        #pragma omp parallel for
+         for (size_t i = 0; i < n_triangles; i++) {
+             triangles_cpu[i] = {vertices.row(triangles(i, 0)), vertices.row(triangles(i, 1)), vertices.row(triangles(i, 2)), (int64_t)i};
+         }
+diff --git a/src/bvh.cu b/src/bvh.cu
+index 1c48314..f7dacf2 100644
+--- a/src/bvh.cu
++++ b/src/bvh.cu
+@@ -497,86 +497,184 @@ public:
+ 
+     }
+ 
+-    void build(std::vector<Triangle>& triangles, uint32_t n_primitives_per_leaf) override {
+-        m_nodes.clear();
+-
+-        // Root
+-        m_nodes.emplace_back();
+-        m_nodes.front().bb = BoundingBox(std::begin(triangles), std::end(triangles));
++private:
++    // Below this many triangles, a subtree is built inline (no OpenMP task spawned) to
++    // keep task-scheduling overhead from dominating on small nodes.
++    static constexpr size_t PARALLEL_BUILD_CUTOFF = 8192;
++
++    // Plan-tree node produced by the (parallel) top-down build. Captures exactly what
++    // the serial builder would have computed for this node -- its bounding box, and
++    // either its leaf triangle range or its BRANCHING_FACTOR children's plans -- without
++    // yet committing to a position in the final flat `m_nodes` array. The expensive part
++    // (variance/axis selection + std::nth_element median partition) only ever touches a
++    // node's own disjoint triangle sub-range, so it can run concurrently across
++    // independent subtrees; the separate, serial `number_and_flatten` pass below then
++    // reproduces the original stack-based builder's exact node-numbering order so the
++    // resulting `m_nodes` is byte-identical to the serial output.
++    struct PlanNode {
++        BoundingBox bb;
++        bool is_leaf = false;
++        // valid iff is_leaf: offsets into the (in-place partitioned) triangles array.
++        int leaf_begin = 0, leaf_end = 0;
++        std::array<std::unique_ptr<PlanNode>, BRANCHING_FACTOR> children;
++        size_t subtree_node_count = 1;
++    };
++
++    // force_split=true is used for the root only: the serial builder unconditionally
++    // pushes the root onto its build_stack (and thus always splits it) regardless of how
++    // many triangles it has, whereas every other node is only split if it has more than
++    // n_primitives_per_leaf triangles. Everything else here mirrors the serial code
++    // (same mean/variance/axis formulas, same std::nth_element calls) exactly.
++    static std::unique_ptr<PlanNode> build_plan(
++        std::vector<Triangle>::iterator begin,
++        std::vector<Triangle>::iterator end,
++        std::vector<Triangle>::iterator triangles_begin,
++        uint32_t n_primitives_per_leaf,
++        bool force_split = false
++    ) {
++        auto node = std::make_unique<PlanNode>();
++        node->bb = BoundingBox(begin, end);
++
++        size_t n = (size_t)std::distance(begin, end);
++        if (!force_split && n <= n_primitives_per_leaf) {
++            node->is_leaf = true;
++            node->leaf_begin = (int)std::distance(triangles_begin, begin);
++            node->leaf_end = (int)std::distance(triangles_begin, end);
++            return node;
++        }
+ 
+-        struct BuildNode {
+-            int node_idx;
++        struct Range {
+             std::vector<Triangle>::iterator begin;
+             std::vector<Triangle>::iterator end;
+         };
++        std::array<Range, BRANCHING_FACTOR> children_ranges;
++        children_ranges[0].begin = begin;
++        children_ranges[0].end = end;
++
++        // Partition the triangles into the children (identical to the serial builder)
++        int n_children = 1;
++        while (n_children < BRANCHING_FACTOR) {
++            for (int i = n_children - 1; i >= 0; --i) {
++                auto& child = children_ranges[i];
++
++                // Choose axis with maximum standard deviation
++                Vector3f mean = Vector3f::Zero();
++                for (auto it = child.begin; it != child.end; ++it) {
++                    mean += it->centroid();
++                }
++                mean /= (float)std::distance(child.begin, child.end);
+ 
+-        std::stack<BuildNode> build_stack;
+-        build_stack.push({0, std::begin(triangles), std::end(triangles)});
++                Vector3f var = Vector3f::Zero();
++                for (auto it = child.begin; it != child.end; ++it) {
++                    Vector3f diff = it->centroid() - mean;
++                    var += diff.cwiseProduct(diff);
++                }
++                var /= (float)std::distance(child.begin, child.end);
+ 
+-    while (!build_stack.empty()) {
+-            const BuildNode& curr = build_stack.top();
+-            size_t node_idx = curr.node_idx;
++                Vector3f::Index axis;
++                var.maxCoeff(&axis);
+ 
+-            std::array<BuildNode, BRANCHING_FACTOR> children;
+-            children[0].begin = curr.begin;
+-            children[0].end = curr.end;
++                auto m = child.begin + std::distance(child.begin, child.end)/2;
++                std::nth_element(child.begin, m, child.end, [&](const Triangle& tri1, const Triangle& tri2) { return tri1.centroid(axis) < tri2.centroid(axis); });
+ 
+-            build_stack.pop();
++                children_ranges[i*2].begin = children_ranges[i].begin;
++                children_ranges[i*2+1].end = children_ranges[i].end;
++                children_ranges[i*2].end = children_ranges[i*2+1].begin = m;
++            }
+ 
+-            // Partition the triangles into the children
+-            int n_children = 1;
+-            while (n_children < BRANCHING_FACTOR) {
+-                for (int i = n_children - 1; i >= 0; --i) {
+-                    auto& child = children[i];
++            n_children *= 2;
++        }
+ 
+-                    // Choose axis with maximum standard deviation
+-                    Vector3f mean = Vector3f::Zero();
+-                    for (auto it = child.begin; it != child.end; ++it) {
+-                        mean += it->centroid();
+-                    }
+-                    mean /= (float)std::distance(child.begin, child.end);
++        node->is_leaf = false;
++        PlanNode* node_ptr = node.get();
++        for (int i = 0; i < BRANCHING_FACTOR; ++i) {
++            auto cbegin = children_ranges[i].begin;
++            auto cend = children_ranges[i].end;
++            assert(cbegin != cend);
++            size_t child_n = (size_t)std::distance(cbegin, cend);
++
++            if (child_n > PARALLEL_BUILD_CUTOFF) {
++                #pragma omp task default(none) firstprivate(i, cbegin, cend, triangles_begin, n_primitives_per_leaf) shared(node_ptr)
++                {
++                    node_ptr->children[i] = build_plan(cbegin, cend, triangles_begin, n_primitives_per_leaf);
++                }
++            } else {
++                // Small enough: recurse inline in the current thread/task rather than
++                // paying OpenMP task-spawn overhead.
++                node_ptr->children[i] = build_plan(cbegin, cend, triangles_begin, n_primitives_per_leaf);
++            }
++        }
++        #pragma omp taskwait
+ 
+-                    Vector3f var = Vector3f::Zero();
+-                    for (auto it = child.begin; it != child.end; ++it) {
+-                        Vector3f diff = it->centroid() - mean;
+-                        var += diff.cwiseProduct(diff);
+-                    }
+-                    var /= (float)std::distance(child.begin, child.end);
++        node->subtree_node_count = 1;
++        for (int i = 0; i < BRANCHING_FACTOR; ++i) {
++            node->subtree_node_count += node->children[i]->subtree_node_count;
++        }
+ 
+-                    Vector3f::Index axis;
+-                    var.maxCoeff(&axis);
++        return node;
++    }
+ 
+-                    auto m = child.begin + std::distance(child.begin, child.end)/2;
+-                    std::nth_element(child.begin, m, child.end, [&](const Triangle& tri1, const Triangle& tri2) { return tri1.centroid(axis) < tri2.centroid(axis); });
++    // Replays the serial builder's exact node-index assignment order. That builder used
++    // a std::stack (LIFO) work queue and pushed a node's BRANCHING_FACTOR children in
++    // index order 0..BRANCHING_FACTOR-1 before popping the next node to expand; since
++    // it's a stack, the next node expanded is always the LAST child just pushed (highest
++    // index), so a child's entire subtree is fully expanded -- recursively, in that same
++    // last-child-first manner -- before its next-lower sibling is touched at all. That is
++    // exactly a recursive DFS visiting children in order BRANCHING_FACTOR-1, ..., 1, 0.
++    // Reproducing that order here (single-threaded; O(#nodes), no per-node math) makes
++    // the resulting `m_nodes` byte-identical to the serial builder's output.
++    void number_and_flatten(PlanNode* plan, int node_idx) {
++        if (plan->is_leaf) {
++            m_nodes[node_idx].left_idx = -plan->leaf_begin - 1;
++            m_nodes[node_idx].right_idx = -plan->leaf_end - 1;
++            return;
++        }
+ 
+-                    children[i*2].begin = children[i].begin;
+-                    children[i*2+1].end = children[i].end;
+-                    children[i*2].end = children[i*2+1].begin = m;
+-                }
++        int first_child = (int)m_nodes.size();
++        m_nodes[node_idx].left_idx = first_child;
++        for (int i = 0; i < BRANCHING_FACTOR; ++i) {
++            m_nodes.emplace_back();
++            m_nodes.back().bb = plan->children[i]->bb;
++        }
++        m_nodes[node_idx].right_idx = (int)m_nodes.size();
+ 
+-                n_children *= 2;
+-            }
++        for (int i = BRANCHING_FACTOR - 1; i >= 0; --i) {
++            number_and_flatten(plan->children[i].get(), first_child + i);
++        }
++    }
+ 
+-            // Create next build nodes
+-            m_nodes[node_idx].left_idx = (int)m_nodes.size();
+-            for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+-                auto& child = children[i];
+-                assert(child.begin != child.end);
+-                child.node_idx = (int)m_nodes.size();
+-
+-                m_nodes.emplace_back();
+-                m_nodes.back().bb = BoundingBox(child.begin, child.end);
+-
+-                if (std::distance(child.begin, child.end) <= n_primitives_per_leaf) {
+-                    m_nodes.back().left_idx = -(int)std::distance(std::begin(triangles), child.begin)-1;
+-                    m_nodes.back().right_idx = -(int)std::distance(std::begin(triangles), child.end)-1;
+-                } else {
+-                    build_stack.push(child);
+-                }
++public:
++    void build(std::vector<Triangle>& triangles, uint32_t n_primitives_per_leaf) override {
++        m_nodes.clear();
++
++        auto triangles_begin = std::begin(triangles);
++        auto triangles_end = std::end(triangles);
++
++        // Phase 1 (parallel): build the tree STRUCTURE -- axis/variance choice and
++        // std::nth_element median partitioning, byte-identical per node to the serial
++        // algorithm -- concurrently across independent subtrees (OpenMP tasks below
++        // PARALLEL_BUILD_CUTOFF triangles/node run inline instead). This also partitions
++        // `triangles` in place exactly as the serial builder does: since each task only
++        // ever touches its own disjoint sub-range, the resulting permutation of
++        // `triangles` matches the serial builder's regardless of scheduling order.
++        std::unique_ptr<PlanNode> root_plan;
++        size_t n_triangles = triangles.size();
++        #pragma omp parallel default(none) shared(root_plan, triangles_begin, triangles_end, n_primitives_per_leaf) if(n_triangles > PARALLEL_BUILD_CUTOFF)
++        {
++            #pragma omp single
++            {
++                root_plan = build_plan(triangles_begin, triangles_end, triangles_begin, n_primitives_per_leaf, /*force_split=*/true);
+             }
+-            m_nodes[node_idx].right_idx = (int)m_nodes.size();
+         }
+ 
++        // Phase 2 (serial, cheap: O(#nodes)): assign node indices in the exact order of
++        // the original std::stack-based builder (see number_and_flatten), so `m_nodes`
++        // comes out byte-identical to the serial output.
++        m_nodes.reserve(root_plan->subtree_node_count);
++        m_nodes.emplace_back();
++        m_nodes.back().bb = root_plan->bb;
++        number_and_flatten(root_plan.get(), 0);
++
+         // Thread the BVH with escape links for stackless traversal.
+         // Initialize all escape indices to -1.
+         for (auto& n : m_nodes) n.escape_idx = -1;

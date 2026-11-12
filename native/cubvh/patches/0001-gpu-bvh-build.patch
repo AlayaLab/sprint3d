@@ -1,0 +1,1585 @@
+diff --git a/fastpixal3d_cubvh/api.py b/fastpixal3d_cubvh/api.py
+index cd395bf..3f88767 100644
+--- a/fastpixal3d_cubvh/api.py
++++ b/fastpixal3d_cubvh/api.py
+@@ -10,18 +10,46 @@ _sdf_mode_to_id = {
+ }
+ 
+ class cuBVH():
+-    def __init__(self, vertices, triangles):
+-        # vertices: np.ndarray, [N, 3]
+-        # triangles: np.ndarray, [M, 3]
+-
+-        if torch.is_tensor(vertices): vertices = vertices.detach().cpu().numpy()
+-        if torch.is_tensor(triangles): triangles = triangles.detach().cpu().numpy()
++    def __init__(self, vertices, triangles, build_mode="gpu"):
++        # vertices: np.ndarray or torch.Tensor, [N, 3]
++        # triangles: np.ndarray or torch.Tensor, [M, 3]
++        # build_mode: "gpu" (default) -- GPU-resident Karras LBVH build, tens of ms even
++        #             for 5-25M triangles; triangles never touch the host.
++        #             "host" -- original CPU (OpenMP-parallel) top-down median-split
++        #             builder, for A/B comparison against build_mode="gpu".
+ 
+         # check inputs
+         assert triangles.shape[0] > 8, "BVH needs at least 8 triangles."
+-        
++
++        # Move straight to CUDA tensors and hand them to the backend as-is: the backend's
++        # create_cuBVH gathers Triangle structs on the GPU itself (src/api_gpu.cu
++        # gather_triangles_kernel), so unlike the original cuBVH (which forced a
++        # .cpu().numpy() round-trip before its pybind11/Eigen-bound create_cuBVH), a
++        # CUDA input here never touches the host at all.
++        if torch.is_tensor(vertices):
++            vertices = vertices.to(dtype=torch.float32)
++            if not vertices.is_cuda: vertices = vertices.cuda()
++        else:
++            vertices = torch.as_tensor(np.ascontiguousarray(vertices, dtype=np.float32)).cuda()
++
++        if torch.is_tensor(triangles):
++            triangles = triangles.to(dtype=torch.int32)
++            if not triangles.is_cuda: triangles = triangles.cuda()
++        else:
++            triangles = torch.as_tensor(np.ascontiguousarray(triangles, dtype=np.int32)).cuda()
++
++        vertices = vertices.contiguous()
++        triangles = triangles.contiguous()
++
+         # implementation
+-        self.impl = _backend.create_cuBVH(vertices, triangles)
++        self.impl = _backend.create_cuBVH(vertices, triangles, build_mode)
++
++    def validate(self):
++        # Host-side structural validation of the built node array (downloads nodes +
++        # triangles; slow, debugging only). Returns a dict of counters; "n_errors" == 0
++        # means every layout invariant the query kernels rely on holds (see
++        # cuBVHImpl::validate in src/api_gpu.cu for the list).
++        return dict(self.impl.validate())
+ 
+     def ray_trace(self, rays_o, rays_d):
+         # rays_o: torch.Tensor, float, [N, 3]
+diff --git a/include/gpu/api_gpu.h b/include/gpu/api_gpu.h
+index 828dcd3..8616927 100644
+--- a/include/gpu/api_gpu.h
++++ b/include/gpu/api_gpu.h
+@@ -1,15 +1,11 @@
+ #pragma once
+ 
+-#include <Eigen/Dense>
+ #include <ATen/cuda/CUDAContext.h>
+ #include <torch/torch.h>
+ #include <cuda_runtime.h>
++#include <map>
+ #include <memory>
+-
+-using namespace Eigen;
+-
+-using Verts = Matrix<float, Dynamic, 3, RowMajor>;
+-using Trigs = Matrix<uint32_t, Dynamic, 3, RowMajor>;
++#include <string>
+ 
+ namespace fastpixal3d_cubvh_ns {
+ namespace cubvh {
+@@ -23,10 +19,20 @@ public:
+     virtual void ray_trace(at::Tensor rays_o, at::Tensor rays_d, at::Tensor positions, at::Tensor face_id, at::Tensor depth) = 0;
+     virtual void unsigned_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw) = 0;
+     virtual void signed_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw, uint32_t mode) = 0;
++
++    // Host-side structural validation of the built tree (downloads nodes + triangles;
++    // slow, debugging only). Returns counters; "n_errors" == 0 means every invariant
++    // the query kernels rely on holds. See cuBVHImpl::validate in src/api_gpu.cu.
++    virtual std::map<std::string, int64_t> validate() = 0;
+ };
+ 
+-// function to create an implementation of cuBVH
+-cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles);
++// Build a cuBVH directly from CUDA tensors -- no host round-trip. `vertices`
++// must be a CUDA float32 [V,3] tensor, `faces` a CUDA int32 [F,3] tensor.
++// `build_mode`: "gpu" (default) builds the tree entirely on the GPU
++// (Karras LBVH, src/lbvh_build.cu); "host" downloads the gathered triangles
++// once and uses the original (CPU, OpenMP-parallel) top-down median-split
++// builder, for A/B comparison.
++cuBVH* create_cuBVH(at::Tensor vertices, at::Tensor faces, const std::string& build_mode);
+ // floodfill
+ at::Tensor floodfill(at::Tensor grid);
+ 
+diff --git a/include/gpu/bvh.cuh b/include/gpu/bvh.cuh
+index ca24ac3..7209d13 100644
+--- a/include/gpu/bvh.cuh
++++ b/include/gpu/bvh.cuh
+@@ -6,6 +6,7 @@
+ #include <gpu/gpu_memory.h>
+ 
+ #include <memory>
++#include <stdexcept>
+ 
+ namespace fastpixal3d_cubvh_ns {
+ namespace cubvh {
+@@ -67,6 +68,17 @@ protected:
+ public:
+     virtual void build(std::vector<Triangle>& triangles, uint32_t n_primitives_per_leaf) = 0;
+ 
++    // Device-side (GPU-resident) build: Karras-2012 LBVH construction. `triangles_gpu`
++    // holds n_triangles Triangle structs on entry and is REPLACED IN PLACE (same size)
++    // with the Morton-sorted array that the resulting node layout's leaf ranges index
++    // into (mirrors how the host `build()` above reorders its std::vector<Triangle> in
++    // place). Only the LBVH-mode variant (TriangleBvhLBVH, build_mode="gpu") overrides
++    // this; the default throws so the host-build variant (build_mode="host") never
++    // silently no-ops if called by mistake.
++    virtual void build_device(GPUMemory<Triangle>& triangles_gpu, uint32_t n_triangles, uint32_t n_primitives_per_leaf, cudaStream_t stream) {
++        throw std::runtime_error("build_device() not supported by this TriangleBvh variant");
++    }
++
+     virtual void signed_distance_gpu(uint32_t n_elements, uint32_t mode, const float* positions, float* distances, int64_t* face_id, float* uvw, const Triangle* gpu_triangles, cudaStream_t stream) = 0;
+     virtual void unsigned_distance_gpu(uint32_t n_elements, const float* positions, float* distances, int64_t* face_id, float* uvw, const Triangle* gpu_triangles, cudaStream_t stream) = 0;
+     virtual void ray_trace_gpu(uint32_t n_elements, const float* rays_o, const float* rays_d, float* positions, int64_t* face_id, float* depth, const Triangle* gpu_triangles, cudaStream_t stream) = 0;
+@@ -75,12 +87,32 @@ public:
+     // virtual bool touches_triangle(const BoundingBox& bb, const Triangle* __restrict__ triangles) const = 0;
+     // virtual void build_optix(const GPUMemory<Triangle>& triangles, cudaStream_t stream) = 0;
+ 
+-    static std::unique_ptr<TriangleBvh> make();
++    // build_mode="host": serial/OpenMP-parallel top-down median-split builder (the original
++    // top-down builder, OpenMP-parallel over subtrees), BRANCHING_FACTOR=4, host std::vector<Triangle> input.
++    static std::unique_ptr<TriangleBvh> make_host();
++    // build_mode="gpu": GPU-resident Karras LBVH builder, BRANCHING_FACTOR=2, triangles
++    // stay device-resident throughout (see build_device() above).
++    static std::unique_ptr<TriangleBvh> make_lbvh();
+ 
+     TriangleBvhNode* nodes_gpu() const {
+         return m_nodes_gpu.data();
+     }
+ 
++    size_t n_nodes() const {
++        return m_nodes_gpu.size();
++    }
++
++    // Blocking download of the (device-resident) node array, for host-side
++    // structural validation (see cuBVH::validate in api_gpu.cu).
++    std::vector<TriangleBvhNode> nodes_host() const {
++        std::vector<TriangleBvhNode> nodes(m_nodes_gpu.size());
++        if (!nodes.empty()) m_nodes_gpu.copy_to_host(nodes);
++        return nodes;
++    }
++
++    // Number of contiguous children per internal node ([left_idx, left_idx + N)).
++    virtual uint32_t branching_factor() const = 0;
++
+ };
+ 
+ } // namespace cubvh
+diff --git a/include/gpu/gpu_memory.h b/include/gpu/gpu_memory.h
+index a4ff1ec..2dd6b4d 100644
+--- a/include/gpu/gpu_memory.h
++++ b/include/gpu/gpu_memory.h
+@@ -32,7 +32,10 @@
+ #pragma once
+ 
+ #include <gpu/common.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <algorithm>
+ #include <atomic>
++#include <cstring>
+ #include <stdexcept>
+ #include <stdint.h>
+ #include <string>
+@@ -225,7 +228,67 @@ public:
+     /// Copy data of num_elements from the raw pointer on the host
+     void copy_from_host(const T* host_data, const size_t num_elements) {
+         try {
+-            CUDA_CHECK_THROW(cudaMemcpy(data(), host_data, num_elements * sizeof(T), cudaMemcpyHostToDevice));
++            const size_t n_bytes = num_elements * sizeof(T);
++            if (n_bytes == 0) {
++                return;
++            }
++
++            // Stage through pinned host memory instead of the default synchronous
++            // pageable-memory cudaMemcpy: allocate one cudaHostAlloc buffer sized to
++            // the whole transfer, fill it with a single host-side memcpy, then issue
++            // it to the device as a sequence of <=256 MiB cudaMemcpyAsync chunks on
++            // the CURRENT PyTorch CUDA stream (at::cuda::getCurrentCUDAStream() --
++            // matching every other CUDA call in this file: ray_trace/unsigned_distance/
++            // signed_distance/sparse_marching_cubes all use it; this function used to
++            // hardcode the LEGACY DEFAULT STREAM (0) instead, which -- unlike every
++            // other stream in this codebase -- implicitly participates in cross-stream
++            // synchronization with any other work queued on the same device, a real
++            // divergence from the rest of the file's stream discipline when this
++            // upload runs concurrently with other CUDA work on other threads/streams
++            // (e.g. a texture-sampling stream running concurrently with mesh
++            // preparation). Followed by ONE cudaStreamSynchronize on
++            // that same stream. This produces bit-identical device contents to the
++            // plain cudaMemcpy fallback below; it exists only to avoid the CUDA
++            // driver's slower pageable-memory H2D path (about 1 GB/s on the machines we tried) on
++            // large uploads (cuBVH triangles/nodes).
++            //
++            // The pinned buffer is owned by a local RAII guard (PinnedHostGuard) so it
++            // is freed exactly once on every exit path -- including an exception
++            // thrown mid-copy -- via a destructor that only ever calls cudaFreeHost
++            // and discards its result (a destructor must never throw: there is nothing
++            // actionable to do here with a free failure, and even a "sticky"/fatal CUDA
++            // error from an earlier failed call makes cudaFreeHost return an error
++            // code, not throw, so this remains safe to call unconditionally).
++            void* raw_pinned = nullptr;
++            cudaError_t alloc_err = cudaHostAlloc(&raw_pinned, n_bytes, cudaHostAllocPortable);
++            if (alloc_err != cudaSuccess) {
++                cudaGetLastError(); // clear the sticky error before falling back
++                CUDA_CHECK_THROW(cudaMemcpy(data(), host_data, n_bytes, cudaMemcpyHostToDevice));
++                return;
++            }
++
++            struct PinnedHostGuard {
++                void* ptr;
++                ~PinnedHostGuard() noexcept {
++                    if (ptr) {
++                        cudaFreeHost(ptr);
++                    }
++                }
++            } guard{raw_pinned};
++            uint8_t* pinned = (uint8_t*)raw_pinned;
++
++            std::memcpy(pinned, host_data, n_bytes);
++
++            cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++            constexpr size_t kChunkBytes = size_t{256} << 20; // 256 MiB
++            uint8_t* dst = (uint8_t*)data();
++            for (size_t offset = 0; offset < n_bytes; offset += kChunkBytes) {
++                const size_t this_chunk = std::min(kChunkBytes, n_bytes - offset);
++                CUDA_CHECK_THROW(cudaMemcpyAsync(dst + offset, pinned + offset, this_chunk, cudaMemcpyHostToDevice, stream));
++            }
++            CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
++            // `guard` frees the pinned buffer here on normal return, or while
++            // unwinding to the catch below if a CUDA_CHECK_THROW above threw.
+         } catch (std::runtime_error error) {
+             throw std::runtime_error(std::string("Could not copy from host: ") + error.what());
+         }
+diff --git a/include/gpu/lbvh_build.cuh b/include/gpu/lbvh_build.cuh
+new file mode 100644
+index 0000000..cc32e88
+--- /dev/null
++++ b/include/gpu/lbvh_build.cuh
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include <gpu/common.h>
++#include <gpu/triangle.cuh>
++#include <gpu/bvh.cuh>
++#include <gpu/gpu_memory.h>
++
++namespace fastpixal3d_cubvh_ns {
++namespace cubvh {
++
++// Builds a binary LBVH (Karras 2012) entirely on the GPU: computes triangle
++// centroids/AABBs, 30-bit Morton codes over the scene (centroid) AABB, sorts
++// primitives by Morton code (cub::DeviceRadixSort), constructs the binary
++// radix-tree hierarchy via longest-common-prefix ranges, refits AABBs
++// bottom-up with atomic counters, collapses subtrees whose triangle range is
++// <= n_primitives_per_leaf into a single leaf, and flattens the result into
++// the same TriangleBvhNode layout used by the existing query traversal
++// (bvh.cu), instantiated here with BRANCHING_FACTOR=2: every internal node's
++// two children sit contiguously at [left_idx, left_idx+2).
++//
++// `triangles_gpu` holds n_triangles Triangle structs on entry (any order) and
++// is replaced in place with the Morton-sorted array (leaf triangle ranges in
++// the resulting nodes index into this reordered array; each Triangle's `id`
++// field is untouched by the reorder, so it always reflects the *original*
++// face index regardless of position -- matching the host builder's
++// behavior). `nodes_gpu` is (re)sized to the final node count and filled.
++//
++// No host-side per-node work: the only host<->device synchronization points
++// are (a) one tiny readback of the root's collapse flag + final node count
++// after the bottom-up refit, and (b) one readback of the next BFS frontier's
++// size per tree level (~O(log n) levels) while flattening.
++void build_lbvh_device(
++    GPUMemory<Triangle>& triangles_gpu,
++    GPUMemory<TriangleBvhNode>& nodes_gpu,
++    uint32_t n_primitives_per_leaf,
++    cudaStream_t stream
++);
++
++} // namespace cubvh
++} // namespace fastpixal3d_cubvh_ns
+diff --git a/setup.py b/setup.py
+index 2e38730..54ee0e4 100644
+--- a/setup.py
++++ b/setup.py
+@@ -42,10 +42,16 @@ base_nvcc_flags = [
+ ]
+ 
+ if os.name == "posix":
+-	base_cflags = ["-O3", f"-std=c++{cpp_standard}"]
++	# -fvisibility=hidden: pybind11's recommended setting so this module's C++ type
++	# registrations (e.g. cuBVH) stay module-local and never get folded together with an
++	# identically-named type in another extension (e.g. the installed cumesh's _cubvh)
++	# by the dynamic linker -- see https://pybind11.readthedocs.io/en/stable/faq.html.
++	base_cflags = ["-O3", f"-std=c++{cpp_standard}", "-fopenmp", "-fvisibility=hidden"]
+ 	base_nvcc_flags += [
+ 		"-Xcompiler=-Wno-float-conversion",
+ 		"-Xcompiler=-fno-strict-aliasing",
++		"-Xcompiler=-fopenmp",
++		"-Xcompiler=-fvisibility=hidden",
+ 	]
+ elif os.name == "nt":
+ 	base_cflags = ["/O2", f"/std:c++{cpp_standard}"]
+@@ -64,6 +70,7 @@ setup(
+ 			name='_fastpixal3d_cubvh',
+ 			sources=[os.path.join('src', f) for f in [
+ 				'bvh.cu',
++				'lbvh_build.cu',
+ 				'api_gpu.cu',
+ 				'bindings.cpp',
+ 			]],
+@@ -74,7 +81,8 @@ setup(
+ 			extra_compile_args={
+ 				'cxx': base_cflags,
+ 				'nvcc': base_nvcc_flags,
+-			}
++			},
++			extra_link_args=['-fopenmp'],
+ 		),
+ 	],
+ 	cmdclass={
+diff --git a/src/api_gpu.cu b/src/api_gpu.cu
+index acab1b0..f1b8b56 100644
+--- a/src/api_gpu.cu
++++ b/src/api_gpu.cu
+@@ -7,40 +7,82 @@
+ 
+ #include <Eigen/Dense>
+ 
+-using namespace Eigen;
+-
+-using Verts = Matrix<float, Dynamic, 3, RowMajor>;
+-using Trigs = Matrix<uint32_t, Dynamic, 3, RowMajor>;
++#include <algorithm>
++#include <cstdio>
++#include <map>
++#include <string>
++#include <vector>
+ 
+ namespace fastpixal3d_cubvh_ns {
+ namespace cubvh {
+ 
++// Gathers Triangle structs directly on the GPU from a [V,3] float32 vertex
++// tensor and a [F,3] int32 face-index tensor -- the no-host-round-trip
++// counterpart of the CPU gather loop the original create_cuBVH used to run
++// over pybind11/Eigen-bound numpy arrays. `id` is set to the original
++// (pre-sort) face index `i`, exactly like the CPU path, so it is preserved
++// correctly through the LBVH's Morton-order reorder of `triangles`
++// (src/lbvh_build.cu) and through the host builder's in-place partition
++// (bvh.cu TriangleBvhWithBranchingFactor::build).
++__global__ void gather_triangles_kernel(
++    uint32_t n_triangles, const Eigen::Vector3f* __restrict__ vertices,
++    const int32_t* __restrict__ faces, Triangle* __restrict__ out
++) {
++    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_triangles) return;
++
++    Triangle t;
++    t.a = vertices[faces[3 * i + 0]];
++    t.b = vertices[faces[3 * i + 1]];
++    t.c = vertices[faces[3 * i + 2]];
++    t.id = (int64_t)i;
++    out[i] = t;
++}
++
+ class cuBVHImpl : public cuBVH {
+ public:
+ 
+-    // accept numpy array (cpu) to init 
+-    cuBVHImpl(Ref<const Verts> vertices, Ref<const Trigs> triangles) : cuBVH() {
++    // Build directly from CUDA tensors: triangles are gathered on the GPU
++    // and, for build_mode="gpu", never touch the host at all.
++    cuBVHImpl(at::Tensor vertices, at::Tensor faces, const std::string& build_mode) : cuBVH() {
+ 
+-        const size_t n_vertices = vertices.rows();
+-        const size_t n_triangles = triangles.rows();
++        TORCH_CHECK(vertices.is_cuda(), "vertices must be a CUDA tensor");
++        TORCH_CHECK(faces.is_cuda(), "faces must be a CUDA tensor");
++        vertices = vertices.contiguous();
++        faces = faces.contiguous();
++        TORCH_CHECK(vertices.scalar_type() == at::kFloat, "vertices must be float32");
++        TORCH_CHECK(faces.scalar_type() == at::kInt, "faces must be int32");
++        TORCH_CHECK(vertices.dim() == 2 && vertices.size(1) == 3, "vertices must be [V,3]");
++        TORCH_CHECK(faces.dim() == 2 && faces.size(1) == 3, "faces must be [F,3]");
+ 
+-        triangles_cpu.resize(n_triangles);
+-
+-        for (size_t i = 0; i < n_triangles; i++) {
+-            triangles_cpu[i] = {vertices.row(triangles(i, 0)), vertices.row(triangles(i, 1)), vertices.row(triangles(i, 2)), (int64_t)i};
+-        }
++        const uint32_t n_triangles = (uint32_t)faces.size(0);
++        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+-        if (!triangle_bvh) {
+-            triangle_bvh = TriangleBvh::make();
++        triangles_gpu.resize(n_triangles);
++        linear_kernel(gather_triangles_kernel, 0u, stream,
++            n_triangles,
++            (const Eigen::Vector3f*)vertices.data_ptr<float>(),
++            faces.data_ptr<int32_t>(),
++            triangles_gpu.data()
++        );
++
++        if (build_mode == "gpu") {
++            triangle_bvh = TriangleBvh::make_lbvh();
++            triangle_bvh->build_device(triangles_gpu, n_triangles, 8, stream);
++        } else if (build_mode == "host") {
++            // Reference/A-B path: download the gathered triangles once and reuse the
++            // original CPU (OpenMP-parallel, BRANCHING_FACTOR=4) builder unchanged.
++            CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
++            triangles_cpu.resize(n_triangles);
++            triangles_gpu.copy_to_host(triangles_cpu);
++
++            triangle_bvh = TriangleBvh::make_host();
++            triangle_bvh->build(triangles_cpu, 8);
++
++            triangles_gpu.resize_and_copy_from_host(triangles_cpu);
++        } else {
++            TORCH_CHECK(false, "create_cuBVH: unknown build_mode '", build_mode, "' (expected 'gpu' or 'host')");
+         }
+-
+-        triangle_bvh->build(triangles_cpu, 8);
+-
+-        triangles_gpu.resize_and_copy_from_host(triangles_cpu);
+-
+-        // TODO: need OPTIX
+-        // triangle_bvh->build_optix(triangles_gpu, m_inference_stream);
+-
+     }
+ 
+     void ray_trace(at::Tensor rays_o, at::Tensor rays_d, at::Tensor positions, at::Tensor face_id, at::Tensor depth) {
+@@ -68,13 +110,142 @@ public:
+         triangle_bvh->signed_distance_gpu(n_elements, mode, positions.data_ptr<float>(), distances.data_ptr<float>(), face_id.data_ptr<int64_t>(), uvw.has_value() ? uvw.value().data_ptr<float>() : nullptr, triangles_gpu.data(), stream);
+     }
+ 
+-    std::vector<Triangle> triangles_cpu;
++    // Structural validation of the node array against the layout the query kernels
++    // in bvh.cu assume (identical for the host and the LBVH builder; only the
++    // branching factor N differs):
++    //   * leaf:     left_idx < 0, range [begin, end) = [-left_idx-1, -right_idx-1),
++    //               0 <= begin < end <= F; leaf bb contains every triangle in range.
++    //   * internal: children contiguous at [left_idx, left_idx + N), right_idx ==
++    //               left_idx + N, all < n_nodes; each child's bb inside the parent's.
++    //   * every node reachable from the root exactly once via child links (a tree);
++    //   * escape_idx == pre-order successor rule (next sibling, else parent's escape;
++    //     root -1), verified against a DFS that recomputes it;
++    //   * the leaf ranges, sorted by begin, tile [0, F) exactly once;
++    //   * the (reordered) triangles' `id`s form a permutation of [0, F).
++    // Returns counters; "n_errors" is the total number of violated checks (a few
++    // representative violations are printed to stderr).
++    std::map<std::string, int64_t> validate() override {
++        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++        CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
++
++        const int64_t F = (int64_t)triangles_gpu.size();
++        std::vector<Triangle> tris(F);
++        if (F > 0) triangles_gpu.copy_to_host(tris);
++        std::vector<TriangleBvhNode> nodes = triangle_bvh->nodes_host();
++        const int64_t n_nodes = (int64_t)nodes.size();
++        const int64_t N = (int64_t)triangle_bvh->branching_factor();
++
++        std::map<std::string, int64_t> st;
++        int64_t n_errors = 0, n_printed = 0;
++        auto fail = [&](const char* what, int64_t node) {
++            ++n_errors;
++            if (n_printed < 20) {
++                fprintf(stderr, "[cuBVH::validate] %s (node %lld)\n", what, (long long)node);
++                ++n_printed;
++            }
++        };
++        auto bb_contains = [](const BoundingBox& outer, const BoundingBox& inner) {
++            return (inner.min.array() >= outer.min.array()).all() && (inner.max.array() <= outer.max.array()).all();
++        };
++
++        st["n_nodes"] = n_nodes;
++        st["n_triangles"] = F;
++        st["branching_factor"] = N;
++        if (n_nodes == 0) { fail("empty node array", -1); st["n_errors"] = n_errors; return st; }
++
++        // Pass 1: per-node local invariants.
++        int64_t n_leaves = 0, n_internal = 0, max_leaf_size = 0, n_bb_not_union = 0;
++        std::vector<std::pair<int64_t, int64_t>> ranges;
++        for (int64_t i = 0; i < n_nodes; ++i) {
++            const auto& nd = nodes[i];
++            if (nd.left_idx < 0) {
++                ++n_leaves;
++                int64_t begin = -(int64_t)nd.left_idx - 1, end = -(int64_t)nd.right_idx - 1;
++                if (begin < 0 || end > F || begin >= end) { fail("leaf range out of [0,F) or empty", i); continue; }
++                ranges.emplace_back(begin, end);
++                max_leaf_size = std::max(max_leaf_size, end - begin);
++                BoundingBox u;
++                for (int64_t t = begin; t < end; ++t) u.enlarge(tris[t]);
++                if (!bb_contains(nd.bb, u)) fail("leaf bb does not contain its triangles", i);
++                if (!(u.min == nd.bb.min && u.max == nd.bb.max)) ++n_bb_not_union;
++            } else {
++                ++n_internal;
++                int64_t first = nd.left_idx, end = nd.right_idx;
++                if (end != first + N) fail("internal right_idx != left_idx + N", i);
++                if (first <= i || first + N > n_nodes) { fail("internal child range out of bounds / not after parent", i); continue; }
++                BoundingBox u;
++                for (int64_t c = first; c < first + N; ++c) {
++                    if (!bb_contains(nd.bb, nodes[c].bb)) fail("child bb not inside parent bb", i);
++                    u.enlarge(nodes[c].bb);
++                }
++                if (!(u.min == nd.bb.min && u.max == nd.bb.max)) ++n_bb_not_union;
++            }
++        }
++        st["n_leaves"] = n_leaves;
++        st["n_internal"] = n_internal;
++        st["max_leaf_size"] = max_leaf_size;
++        st["n_bb_not_exact_union"] = n_bb_not_union; // informational (host bb == union too, but not required)
++
++        // Pass 2: tree-ness, escape links, depth -- explicit-stack pre-order DFS from root.
++        std::vector<uint8_t> visited(n_nodes, 0);
++        struct Frame { int64_t node, escape, depth; };
++        std::vector<Frame> stack;
++        stack.push_back({0, -1, 0});
++        int64_t n_visited = 0, max_depth = 0, n_escape_bad = 0;
++        while (!stack.empty()) {
++            Frame f = stack.back(); stack.pop_back();
++            if (f.node < 0 || f.node >= n_nodes) { fail("child index out of range", f.node); continue; }
++            if (visited[f.node]) { fail("node reached twice (not a tree)", f.node); continue; }
++            visited[f.node] = 1; ++n_visited;
++            max_depth = std::max(max_depth, f.depth);
++            const auto& nd = nodes[f.node];
++            if (nd.escape_idx != (int)f.escape) { ++n_escape_bad; fail("escape_idx != pre-order successor", f.node); }
++            if (nd.left_idx < 0) continue;
++            int64_t first = nd.left_idx;
++            if (first <= f.node || first + N > n_nodes) continue; // already reported
++            for (int64_t k = N - 1; k >= 0; --k) {
++                int64_t c = first + k;
++                int64_t esc = (k + 1 < N) ? (c + 1) : f.escape;
++                stack.push_back({c, esc, f.depth + 1});
++            }
++        }
++        if (n_visited != n_nodes) fail("not every node reachable from the root", n_visited);
++        st["n_reachable"] = n_visited;
++        st["max_depth"] = max_depth;
++        st["n_escape_bad"] = n_escape_bad;
++
++        // Pass 3: leaf ranges tile [0, F) exactly once.
++        std::sort(ranges.begin(), ranges.end());
++        int64_t expect = 0, n_tile_bad = 0;
++        for (const auto& r : ranges) {
++            if (r.first != expect) ++n_tile_bad;
++            expect = r.second;
++        }
++        if (expect != F) ++n_tile_bad;
++        if (n_tile_bad) fail("leaf ranges do not tile [0,F) exactly once", n_tile_bad);
++        st["n_tile_bad"] = n_tile_bad;
++
++        // Pass 4: triangle ids are a permutation of [0, F).
++        std::vector<uint8_t> seen(F, 0);
++        int64_t n_id_bad = 0;
++        for (int64_t t = 0; t < F; ++t) {
++            int64_t id = tris[t].id;
++            if (id < 0 || id >= F || seen[id]) ++n_id_bad; else seen[id] = 1;
++        }
++        if (n_id_bad) fail("triangle ids are not a permutation of [0,F)", n_id_bad);
++        st["n_id_bad"] = n_id_bad;
++
++        st["n_errors"] = n_errors;
++        return st;
++    }
++
++    std::vector<Triangle> triangles_cpu; // only populated for build_mode="host"
+     GPUMemory<Triangle> triangles_gpu;
+     std::shared_ptr<TriangleBvh> triangle_bvh;
+ };
+-    
+-cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
+-    return new cuBVHImpl{vertices, triangles};
++
++cuBVH* create_cuBVH(at::Tensor vertices, at::Tensor faces, const std::string& build_mode) {
++    return new cuBVHImpl{vertices, faces, build_mode};
+ }
+ 
+ at::Tensor floodfill(at::Tensor grid) {
+diff --git a/src/bindings.cpp b/src/bindings.cpp
+index a9b5bb3..385a377 100644
+--- a/src/bindings.cpp
++++ b/src/bindings.cpp
+@@ -16,10 +16,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+ // CUDA API
+ py::class_<cuBVH>(m, "cuBVH")
+     .def("ray_trace", &cuBVH::ray_trace)
+-    .def("unsigned_distance", &cuBVH::unsigned_distance)
+-    .def("signed_distance", &cuBVH::signed_distance);
+-
+-m.def("create_cuBVH", &create_cuBVH);
++    // GIL released: pure CUDA work on already-converted at::Tensor arguments
++    .def("unsigned_distance", &cuBVH::unsigned_distance, py::call_guard<py::gil_scoped_release>())
++    .def("signed_distance", &cuBVH::signed_distance)
++    // Host-side structural validation of the built tree (debugging; slow).
++    .def("validate", &cuBVH::validate, py::call_guard<py::gil_scoped_release>());
++
++// GIL released for the whole build (device gather kernel + LBVH construction, or the
++// host builder's CPU work for build_mode="host"): only already-converted at::Tensor
++// arguments and device memory are touched, no Python API is used inside.
++m.def("create_cuBVH", &create_cuBVH,
++    py::arg("vertices"), py::arg("faces"), py::arg("build_mode") = "gpu",
++    py::call_guard<py::gil_scoped_release>());
+ 
+ m.def("floodfill", &floodfill);
+ 
+diff --git a/src/bvh.cu b/src/bvh.cu
+index 9a45c09..1d280d0 100644
+--- a/src/bvh.cu
++++ b/src/bvh.cu
+@@ -3,6 +3,7 @@
+ #include <gpu/triangle.cuh>
+ #include <gpu/bvh.cuh>
+ #include <gpu/pcg32.h>
++#include <gpu/lbvh_build.cuh>
+ 
+ #include <stack>
+ #include <iostream>
+@@ -17,9 +18,20 @@ namespace cubvh {
+ constexpr float MAX_DIST = 1000.0f;
+ constexpr float MAX_DIST_SQ = MAX_DIST*MAX_DIST;
+ 
++// The 4 query kernels are templated on BRANCHING_FACTOR so the same traversal
++// code serves both the host-built BRANCHING_FACTOR=4 tree (TriangleBvh4) and
++// the GPU-built LBVH's BRANCHING_FACTOR=2 tree (TriangleBvhLBVH's base,
++// TriangleBvhWithBranchingFactor<2>): each internal node's stack-based
++// closest_triangle/ray_intersect traversal reads exactly BRANCHING_FACTOR
++// contiguous children starting at node.left_idx, so the template parameter
++// must match the tree that was actually built.
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void signed_distance_watertight_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, bool use_existing_distances_as_upper_bounds);
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void signed_distance_raystab_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, bool use_existing_distances_as_upper_bounds);
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void unsigned_distance_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, bool use_existing_distances_as_upper_bounds);
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void raytrace_kernel(uint32_t n_elements, const Vector3f* __restrict__ rays_o, const Vector3f* __restrict__ rays_d, Vector3f* __restrict__ positions, int64_t* __restrict__ face_id, float* __restrict__ depth, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles);
+ 
+ struct DistAndIdx {
+@@ -434,7 +446,7 @@ public:
+ 
+         if (mode == 0) {
+             // watertight
+-            linear_kernel(signed_distance_watertight_kernel, 0u, stream,
++            linear_kernel(signed_distance_watertight_kernel<BRANCHING_FACTOR>, 0u, stream,
+                 n_elements,
+                 positions_vec,
+                 distances,
+@@ -447,7 +459,7 @@ public:
+ 
+         } else {
+             // raystab
+-            linear_kernel(signed_distance_raystab_kernel, 0u, stream,
++            linear_kernel(signed_distance_raystab_kernel<BRANCHING_FACTOR>, 0u, stream,
+                 n_elements,
+                 positions_vec,
+                 distances,
+@@ -465,7 +477,7 @@ public:
+         const Vector3f* positions_vec = (const Vector3f*)positions;
+         Vector3f* uvw_vec = (Vector3f*)uvw;
+ 
+-        linear_kernel(unsigned_distance_kernel, 0u, stream,
++        linear_kernel(unsigned_distance_kernel<BRANCHING_FACTOR>, 0u, stream,
+             n_elements,
+             positions_vec,
+             distances,
+@@ -484,7 +496,7 @@ public:
+         const Vector3f* rays_d_vec = (const Vector3f*)rays_d;
+         Vector3f* positions_vec = (Vector3f*)positions;
+         
+-        linear_kernel(raytrace_kernel, 0u, stream,
++        linear_kernel(raytrace_kernel<BRANCHING_FACTOR>, 0u, stream,
+             n_elements,
+             rays_o_vec,
+             rays_d_vec,
+@@ -497,86 +509,184 @@ public:
+ 
+     }
+ 
+-    void build(std::vector<Triangle>& triangles, uint32_t n_primitives_per_leaf) override {
+-        m_nodes.clear();
+-
+-        // Root
+-        m_nodes.emplace_back();
+-        m_nodes.front().bb = BoundingBox(std::begin(triangles), std::end(triangles));
++private:
++    // Below this many triangles, a subtree is built inline (no OpenMP task spawned) to
++    // keep task-scheduling overhead from dominating on small nodes.
++    static constexpr size_t PARALLEL_BUILD_CUTOFF = 8192;
++
++    // Plan-tree node produced by the (parallel) top-down build. Captures exactly what
++    // the serial builder would have computed for this node -- its bounding box, and
++    // either its leaf triangle range or its BRANCHING_FACTOR children's plans -- without
++    // yet committing to a position in the final flat `m_nodes` array. The expensive part
++    // (variance/axis selection + std::nth_element median partition) only ever touches a
++    // node's own disjoint triangle sub-range, so it can run concurrently across
++    // independent subtrees; the separate, serial `number_and_flatten` pass below then
++    // reproduces the original stack-based builder's exact node-numbering order so the
++    // resulting `m_nodes` is byte-identical to the serial output.
++    struct PlanNode {
++        BoundingBox bb;
++        bool is_leaf = false;
++        // valid iff is_leaf: offsets into the (in-place partitioned) triangles array.
++        int leaf_begin = 0, leaf_end = 0;
++        std::array<std::unique_ptr<PlanNode>, BRANCHING_FACTOR> children;
++        size_t subtree_node_count = 1;
++    };
++
++    // force_split=true is used for the root only: the serial builder unconditionally
++    // pushes the root onto its build_stack (and thus always splits it) regardless of how
++    // many triangles it has, whereas every other node is only split if it has more than
++    // n_primitives_per_leaf triangles. Everything else here mirrors the serial code
++    // (same mean/variance/axis formulas, same std::nth_element calls) exactly.
++    static std::unique_ptr<PlanNode> build_plan(
++        std::vector<Triangle>::iterator begin,
++        std::vector<Triangle>::iterator end,
++        std::vector<Triangle>::iterator triangles_begin,
++        uint32_t n_primitives_per_leaf,
++        bool force_split = false
++    ) {
++        auto node = std::make_unique<PlanNode>();
++        node->bb = BoundingBox(begin, end);
++
++        size_t n = (size_t)std::distance(begin, end);
++        if (!force_split && n <= n_primitives_per_leaf) {
++            node->is_leaf = true;
++            node->leaf_begin = (int)std::distance(triangles_begin, begin);
++            node->leaf_end = (int)std::distance(triangles_begin, end);
++            return node;
++        }
+ 
+-        struct BuildNode {
+-            int node_idx;
++        struct Range {
+             std::vector<Triangle>::iterator begin;
+             std::vector<Triangle>::iterator end;
+         };
++        std::array<Range, BRANCHING_FACTOR> children_ranges;
++        children_ranges[0].begin = begin;
++        children_ranges[0].end = end;
++
++        // Partition the triangles into the children (identical to the serial builder)
++        int n_children = 1;
++        while (n_children < BRANCHING_FACTOR) {
++            for (int i = n_children - 1; i >= 0; --i) {
++                auto& child = children_ranges[i];
++
++                // Choose axis with maximum standard deviation
++                Vector3f mean = Vector3f::Zero();
++                for (auto it = child.begin; it != child.end; ++it) {
++                    mean += it->centroid();
++                }
++                mean /= (float)std::distance(child.begin, child.end);
+ 
+-        std::stack<BuildNode> build_stack;
+-        build_stack.push({0, std::begin(triangles), std::end(triangles)});
++                Vector3f var = Vector3f::Zero();
++                for (auto it = child.begin; it != child.end; ++it) {
++                    Vector3f diff = it->centroid() - mean;
++                    var += diff.cwiseProduct(diff);
++                }
++                var /= (float)std::distance(child.begin, child.end);
+ 
+-    while (!build_stack.empty()) {
+-            const BuildNode& curr = build_stack.top();
+-            size_t node_idx = curr.node_idx;
++                Vector3f::Index axis;
++                var.maxCoeff(&axis);
+ 
+-            std::array<BuildNode, BRANCHING_FACTOR> children;
+-            children[0].begin = curr.begin;
+-            children[0].end = curr.end;
++                auto m = child.begin + std::distance(child.begin, child.end)/2;
++                std::nth_element(child.begin, m, child.end, [&](const Triangle& tri1, const Triangle& tri2) { return tri1.centroid(axis) < tri2.centroid(axis); });
+ 
+-            build_stack.pop();
++                children_ranges[i*2].begin = children_ranges[i].begin;
++                children_ranges[i*2+1].end = children_ranges[i].end;
++                children_ranges[i*2].end = children_ranges[i*2+1].begin = m;
++            }
+ 
+-            // Partition the triangles into the children
+-            int n_children = 1;
+-            while (n_children < BRANCHING_FACTOR) {
+-                for (int i = n_children - 1; i >= 0; --i) {
+-                    auto& child = children[i];
++            n_children *= 2;
++        }
+ 
+-                    // Choose axis with maximum standard deviation
+-                    Vector3f mean = Vector3f::Zero();
+-                    for (auto it = child.begin; it != child.end; ++it) {
+-                        mean += it->centroid();
+-                    }
+-                    mean /= (float)std::distance(child.begin, child.end);
++        node->is_leaf = false;
++        PlanNode* node_ptr = node.get();
++        for (int i = 0; i < BRANCHING_FACTOR; ++i) {
++            auto cbegin = children_ranges[i].begin;
++            auto cend = children_ranges[i].end;
++            assert(cbegin != cend);
++            size_t child_n = (size_t)std::distance(cbegin, cend);
++
++            if (child_n > PARALLEL_BUILD_CUTOFF) {
++                #pragma omp task default(none) firstprivate(i, cbegin, cend, triangles_begin, n_primitives_per_leaf) shared(node_ptr)
++                {
++                    node_ptr->children[i] = build_plan(cbegin, cend, triangles_begin, n_primitives_per_leaf);
++                }
++            } else {
++                // Small enough: recurse inline in the current thread/task rather than
++                // paying OpenMP task-spawn overhead.
++                node_ptr->children[i] = build_plan(cbegin, cend, triangles_begin, n_primitives_per_leaf);
++            }
++        }
++        #pragma omp taskwait
+ 
+-                    Vector3f var = Vector3f::Zero();
+-                    for (auto it = child.begin; it != child.end; ++it) {
+-                        Vector3f diff = it->centroid() - mean;
+-                        var += diff.cwiseProduct(diff);
+-                    }
+-                    var /= (float)std::distance(child.begin, child.end);
++        node->subtree_node_count = 1;
++        for (int i = 0; i < BRANCHING_FACTOR; ++i) {
++            node->subtree_node_count += node->children[i]->subtree_node_count;
++        }
+ 
+-                    Vector3f::Index axis;
+-                    var.maxCoeff(&axis);
++        return node;
++    }
+ 
+-                    auto m = child.begin + std::distance(child.begin, child.end)/2;
+-                    std::nth_element(child.begin, m, child.end, [&](const Triangle& tri1, const Triangle& tri2) { return tri1.centroid(axis) < tri2.centroid(axis); });
++    // Replays the serial builder's exact node-index assignment order. That builder used
++    // a std::stack (LIFO) work queue and pushed a node's BRANCHING_FACTOR children in
++    // index order 0..BRANCHING_FACTOR-1 before popping the next node to expand; since
++    // it's a stack, the next node expanded is always the LAST child just pushed (highest
++    // index), so a child's entire subtree is fully expanded -- recursively, in that same
++    // last-child-first manner -- before its next-lower sibling is touched at all. That is
++    // exactly a recursive DFS visiting children in order BRANCHING_FACTOR-1, ..., 1, 0.
++    // Reproducing that order here (single-threaded; O(#nodes), no per-node math) makes
++    // the resulting `m_nodes` byte-identical to the serial builder's output.
++    void number_and_flatten(PlanNode* plan, int node_idx) {
++        if (plan->is_leaf) {
++            m_nodes[node_idx].left_idx = -plan->leaf_begin - 1;
++            m_nodes[node_idx].right_idx = -plan->leaf_end - 1;
++            return;
++        }
+ 
+-                    children[i*2].begin = children[i].begin;
+-                    children[i*2+1].end = children[i].end;
+-                    children[i*2].end = children[i*2+1].begin = m;
+-                }
++        int first_child = (int)m_nodes.size();
++        m_nodes[node_idx].left_idx = first_child;
++        for (int i = 0; i < BRANCHING_FACTOR; ++i) {
++            m_nodes.emplace_back();
++            m_nodes.back().bb = plan->children[i]->bb;
++        }
++        m_nodes[node_idx].right_idx = (int)m_nodes.size();
+ 
+-                n_children *= 2;
+-            }
++        for (int i = BRANCHING_FACTOR - 1; i >= 0; --i) {
++            number_and_flatten(plan->children[i].get(), first_child + i);
++        }
++    }
+ 
+-            // Create next build nodes
+-            m_nodes[node_idx].left_idx = (int)m_nodes.size();
+-            for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+-                auto& child = children[i];
+-                assert(child.begin != child.end);
+-                child.node_idx = (int)m_nodes.size();
+-
+-                m_nodes.emplace_back();
+-                m_nodes.back().bb = BoundingBox(child.begin, child.end);
+-
+-                if (std::distance(child.begin, child.end) <= n_primitives_per_leaf) {
+-                    m_nodes.back().left_idx = -(int)std::distance(std::begin(triangles), child.begin)-1;
+-                    m_nodes.back().right_idx = -(int)std::distance(std::begin(triangles), child.end)-1;
+-                } else {
+-                    build_stack.push(child);
+-                }
++public:
++    void build(std::vector<Triangle>& triangles, uint32_t n_primitives_per_leaf) override {
++        m_nodes.clear();
++
++        auto triangles_begin = std::begin(triangles);
++        auto triangles_end = std::end(triangles);
++
++        // Phase 1 (parallel): build the tree STRUCTURE -- axis/variance choice and
++        // std::nth_element median partitioning, byte-identical per node to the serial
++        // algorithm -- concurrently across independent subtrees (OpenMP tasks below
++        // PARALLEL_BUILD_CUTOFF triangles/node run inline instead). This also partitions
++        // `triangles` in place exactly as the serial builder does: since each task only
++        // ever touches its own disjoint sub-range, the resulting permutation of
++        // `triangles` matches the serial builder's regardless of scheduling order.
++        std::unique_ptr<PlanNode> root_plan;
++        size_t n_triangles = triangles.size();
++        #pragma omp parallel default(none) shared(root_plan, triangles_begin, triangles_end, n_primitives_per_leaf) if(n_triangles > PARALLEL_BUILD_CUTOFF)
++        {
++            #pragma omp single
++            {
++                root_plan = build_plan(triangles_begin, triangles_end, triangles_begin, n_primitives_per_leaf, /*force_split=*/true);
+             }
+-            m_nodes[node_idx].right_idx = (int)m_nodes.size();
+         }
+ 
++        // Phase 2 (serial, cheap: O(#nodes)): assign node indices in the exact order of
++        // the original std::stack-based builder (see number_and_flatten), so `m_nodes`
++        // comes out byte-identical to the serial output.
++        m_nodes.reserve(root_plan->subtree_node_count);
++        m_nodes.emplace_back();
++        m_nodes.back().bb = root_plan->bb;
++        number_and_flatten(root_plan.get(), 0);
++
+         // Thread the BVH with escape links for stackless traversal.
+         // Initialize all escape indices to -1.
+         for (auto& n : m_nodes) n.escape_idx = -1;
+@@ -603,15 +713,41 @@ public:
+         // std::cout << "[INFO] Built TriangleBvh: nodes=" << m_nodes.size() << std::endl;
+     }
+ 
++    uint32_t branching_factor() const override { return BRANCHING_FACTOR; }
++
+     TriangleBvhWithBranchingFactor() {}
+ };
+ 
+ using TriangleBvh4 = TriangleBvhWithBranchingFactor<4>;
++// BRANCHING_FACTOR=2 tree used by the GPU-resident LBVH builder (see
++// TriangleBvhLBVH below): a Karras binary radix tree already has exactly 2
++// children per internal node, so it satisfies TriangleBvhWithBranchingFactor's
++// "children contiguous at [left_idx, left_idx+BRANCHING_FACTOR)" layout
++// requirement with BRANCHING_FACTOR=2 directly, with no query-kernel changes
++// beyond the template parameter.
++using TriangleBvh2 = TriangleBvhWithBranchingFactor<2>;
++
++// build_mode="gpu": overrides build_device() to construct the tree entirely
++// on the GPU (build_lbvh_device, src/lbvh_build.cu) instead of using the
++// (CPU-only) TriangleBvh::build() inherited from TriangleBvh2's base -- that
++// inherited host builder still compiles (it's generic over BRANCHING_FACTOR)
++// but is never called for this variant.
++class TriangleBvhLBVH : public TriangleBvh2 {
++public:
++    void build_device(GPUMemory<Triangle>& triangles_gpu, uint32_t n_triangles, uint32_t n_primitives_per_leaf, cudaStream_t stream) override {
++        build_lbvh_device(triangles_gpu, m_nodes_gpu, n_primitives_per_leaf, stream);
++    }
++};
+ 
+-std::unique_ptr<TriangleBvh> TriangleBvh::make() {
++std::unique_ptr<TriangleBvh> TriangleBvh::make_host() {
+     return std::unique_ptr<TriangleBvh>(new TriangleBvh4());
+ }
+ 
++std::unique_ptr<TriangleBvh> TriangleBvh::make_lbvh() {
++    return std::unique_ptr<TriangleBvh>(new TriangleBvhLBVH());
++}
++
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void signed_distance_watertight_kernel(
+     uint32_t n_elements, const Vector3f* __restrict__ positions,
+     float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw,
+@@ -624,9 +760,9 @@ __global__ void signed_distance_watertight_kernel(
+ 
+     Vector3f point = positions[i];
+ 
+-    auto res = TriangleBvh4::signed_distance_watertight(point, bvhnodes, triangles, max_distance*max_distance);
++    auto res = TriangleBvhWithBranchingFactor<BRANCHING_FACTOR>::signed_distance_watertight(point, bvhnodes, triangles, max_distance*max_distance);
+ 
+-    // write 
++    // write
+     distances[i] = res.second;
+     face_id[i] = triangles[res.first].id;
+ 
+@@ -639,6 +775,7 @@ __global__ void signed_distance_watertight_kernel(
+     }
+ }
+ 
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void signed_distance_raystab_kernel(
+     uint32_t n_elements, const Vector3f* __restrict__ positions,
+     float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw,
+@@ -653,9 +790,9 @@ __global__ void signed_distance_raystab_kernel(
+ 
+     Vector3f point = positions[i];
+ 
+-    auto res = TriangleBvh4::signed_distance_raystab(point, bvhnodes, triangles, max_distance*max_distance, rng);
++    auto res = TriangleBvhWithBranchingFactor<BRANCHING_FACTOR>::signed_distance_raystab(point, bvhnodes, triangles, max_distance*max_distance, rng);
+ 
+-    // write 
++    // write
+     distances[i] = res.second;
+     face_id[i] = triangles[res.first].id;
+ 
+@@ -668,6 +805,7 @@ __global__ void signed_distance_raystab_kernel(
+     }
+ }
+ 
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void unsigned_distance_kernel(
+     uint32_t n_elements, const Vector3f* __restrict__ positions,
+     float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw,
+@@ -680,9 +818,9 @@ __global__ void unsigned_distance_kernel(
+ 
+     Vector3f point = positions[i];
+ 
+-    auto res = TriangleBvh4::closest_triangle(point, bvhnodes, triangles, max_distance*max_distance);
++    auto res = TriangleBvhWithBranchingFactor<BRANCHING_FACTOR>::closest_triangle(point, bvhnodes, triangles, max_distance*max_distance);
+ 
+-    // write 
++    // write
+     distances[i] = res.second;
+     face_id[i] = triangles[res.first].id;
+ 
+@@ -695,9 +833,10 @@ __global__ void unsigned_distance_kernel(
+     }
+ }
+ 
++template <uint32_t BRANCHING_FACTOR>
+ __global__ void raytrace_kernel(
+-    uint32_t n_elements, const Vector3f* __restrict__ rays_o, const Vector3f* __restrict__ rays_d, 
+-    Vector3f* __restrict__ positions, int64_t* __restrict__ face_id, float* __restrict__ depth, 
++    uint32_t n_elements, const Vector3f* __restrict__ rays_o, const Vector3f* __restrict__ rays_d,
++    Vector3f* __restrict__ positions, int64_t* __restrict__ face_id, float* __restrict__ depth,
+     const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles
+ ) {
+     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+@@ -706,11 +845,11 @@ __global__ void raytrace_kernel(
+     Vector3f ro = rays_o[i];
+     Vector3f rd = rays_d[i];
+ 
+-    auto res = TriangleBvh4::ray_intersect(ro, rd, nodes, triangles);
++    auto res = TriangleBvhWithBranchingFactor<BRANCHING_FACTOR>::ray_intersect(ro, rd, nodes, triangles);
+ 
+     // write depth
+     depth[i] = res.second;
+- 
++
+     // intersection point is written back to positions.
+     // non-intersect point reaches at most 10 depth
+     positions[i] = ro + res.second * rd;
+diff --git a/src/lbvh_build.cu b/src/lbvh_build.cu
+new file mode 100644
+index 0000000..c4df9b7
+--- /dev/null
++++ b/src/lbvh_build.cu
+@@ -0,0 +1,520 @@
++#include <gpu/lbvh_build.cuh>
++
++#include <cub/cub.cuh>
++
++#include <algorithm>
++#include <stdexcept>
++#include <string>
++#include <utility>
++
++namespace fastpixal3d_cubvh_ns {
++namespace cubvh {
++
++namespace {
++
++constexpr uint32_t kThreads = 256;
++inline uint32_t n_blocks(uint32_t n) { return (n + kThreads - 1) / kThreads; }
++
++#define LBVH_CUDA_CHECK(x)                                                                        \
++    do {                                                                                          \
++        cudaError_t _lbvh_err = (x);                                                              \
++        if (_lbvh_err != cudaSuccess)                                                             \
++            throw std::runtime_error(std::string("LBVH CUDA error: ") + cudaGetErrorString(_lbvh_err)); \
++    } while (0)
++
++// ---------------------------------------------------------------------------
++// Stage 1: scene AABB of triangle centroids. Two-stage block reduction (no
++// atomics, no host readback -- the result stays on device and is read
++// directly by the Morton-code kernel below). This is the *centroid* AABB
++// (used only to pick the Morton quantization domain); per-node geometric
++// AABBs (used for query pruning) are computed separately from full triangle
++// extents (BoundingBox(triangle)), matching the host builder's semantics.
++// ---------------------------------------------------------------------------
++
++__global__ void centroid_partial_reduce_kernel(
++    uint32_t n, const Triangle* __restrict__ triangles,
++    Eigen::Vector3f* __restrict__ partial_min, Eigen::Vector3f* __restrict__ partial_max
++) {
++    __shared__ Eigen::Vector3f s_min[kThreads];
++    __shared__ Eigen::Vector3f s_max[kThreads];
++
++    Eigen::Vector3f local_min = Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity());
++    Eigen::Vector3f local_max = Eigen::Vector3f::Constant(-std::numeric_limits<float>::infinity());
++
++    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
++        Eigen::Vector3f c = triangles[i].centroid();
++        local_min = local_min.cwiseMin(c);
++        local_max = local_max.cwiseMax(c);
++    }
++
++    s_min[threadIdx.x] = local_min;
++    s_max[threadIdx.x] = local_max;
++    __syncthreads();
++
++    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (threadIdx.x < stride) {
++            s_min[threadIdx.x] = s_min[threadIdx.x].cwiseMin(s_min[threadIdx.x + stride]);
++            s_max[threadIdx.x] = s_max[threadIdx.x].cwiseMax(s_max[threadIdx.x + stride]);
++        }
++        __syncthreads();
++    }
++
++    if (threadIdx.x == 0) {
++        partial_min[blockIdx.x] = s_min[0];
++        partial_max[blockIdx.x] = s_max[0];
++    }
++}
++
++__global__ void centroid_final_reduce_kernel(
++    uint32_t n_partials, const Eigen::Vector3f* __restrict__ partial_min, const Eigen::Vector3f* __restrict__ partial_max,
++    Eigen::Vector3f* __restrict__ scene_min, Eigen::Vector3f* __restrict__ scene_max
++) {
++    __shared__ Eigen::Vector3f s_min[kThreads];
++    __shared__ Eigen::Vector3f s_max[kThreads];
++
++    Eigen::Vector3f local_min = Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity());
++    Eigen::Vector3f local_max = Eigen::Vector3f::Constant(-std::numeric_limits<float>::infinity());
++
++    for (uint32_t i = threadIdx.x; i < n_partials; i += blockDim.x) {
++        local_min = local_min.cwiseMin(partial_min[i]);
++        local_max = local_max.cwiseMax(partial_max[i]);
++    }
++
++    s_min[threadIdx.x] = local_min;
++    s_max[threadIdx.x] = local_max;
++    __syncthreads();
++
++    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (threadIdx.x < stride) {
++            s_min[threadIdx.x] = s_min[threadIdx.x].cwiseMin(s_min[threadIdx.x + stride]);
++            s_max[threadIdx.x] = s_max[threadIdx.x].cwiseMax(s_max[threadIdx.x + stride]);
++        }
++        __syncthreads();
++    }
++
++    if (threadIdx.x == 0) {
++        scene_min[0] = s_min[0];
++        scene_max[0] = s_max[0];
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Stage 2: 30-bit Morton codes (10 bits/axis) over the centroid AABB.
++// ---------------------------------------------------------------------------
++
++__device__ __forceinline__ uint32_t expand_bits10(uint32_t v) {
++    v &= 0x3ffu;
++    v = (v | (v << 16)) & 0xff0000ffu;
++    v = (v | (v << 8))  & 0x0f00f00fu;
++    v = (v | (v << 4))  & 0xc30c30c3u;
++    v = (v | (v << 2))  & 0x49249249u;
++    return v;
++}
++
++__global__ void morton_code_kernel(
++    uint32_t n, const Triangle* __restrict__ triangles,
++    const Eigen::Vector3f* __restrict__ scene_min, const Eigen::Vector3f* __restrict__ scene_max,
++    uint32_t* __restrict__ codes, uint32_t* __restrict__ indices
++) {
++    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++
++    Eigen::Vector3f diag = (*scene_max - *scene_min).cwiseMax(1e-12f);
++    Eigen::Vector3f rel = (triangles[i].centroid() - *scene_min).cwiseQuotient(diag);
++
++    uint32_t x = (uint32_t)std::min(std::max(rel.x() * 1024.0f, 0.0f), 1023.0f);
++    uint32_t y = (uint32_t)std::min(std::max(rel.y() * 1024.0f, 0.0f), 1023.0f);
++    uint32_t z = (uint32_t)std::min(std::max(rel.z() * 1024.0f, 0.0f), 1023.0f);
++
++    codes[i] = (expand_bits10(x) << 2) | (expand_bits10(y) << 1) | expand_bits10(z);
++    indices[i] = i;
++}
++
++__global__ void gather_by_permutation_kernel(
++    uint32_t n, const Triangle* __restrict__ src, const uint32_t* __restrict__ perm, Triangle* __restrict__ dst
++) {
++    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    dst[i] = src[perm[i]];
++}
++
++// ---------------------------------------------------------------------------
++// Stage 3: Karras (2012) binary radix-tree hierarchy from sorted Morton
++// codes. Internal nodes are indexed [0, n-2]; internal node 0 is always the
++// root (a property of the construction). Leaves are indexed [0, n-1] in
++// sorted (Morton) order. Child references use the sign to distinguish
++// leaf/internal: value >= 0 => internal node id; value < 0 => leaf, with
++// leaf id = -value-1. This is a *construction-time-only* encoding, distinct
++// from the final TriangleBvhNode::left_idx/right_idx leaf-range encoding
++// produced by the flatten pass further down.
++// ---------------------------------------------------------------------------
++
++__device__ __forceinline__ int32_t lbvh_delta(const uint32_t* __restrict__ codes, int32_t n, int32_t i, int32_t j) {
++    if (j < 0 || j >= n) return -1;
++    uint32_t ci = codes[i], cj = codes[j];
++    if (ci != cj) return __clz(ci ^ cj);
++    // Duplicate Morton codes (degenerate/duplicate centroids): break the tie
++    // using the sorted-order index, so the range/split binary searches below
++    // still see a strict order. This always compares greater than any
++    // genuine code mismatch (clz of a nonzero 32-bit value is <= 31),
++    // equivalent to Karras 2012's "append index as low bits of the key"
++    // treatment of duplicate keys.
++    return 32 + __clz((uint32_t)(i ^ j));
++}
++
++__global__ void karras_build_kernel(
++    const uint32_t* __restrict__ codes, int32_t n,
++    int32_t* __restrict__ left_child, int32_t* __restrict__ right_child,
++    int32_t* __restrict__ range_first, int32_t* __restrict__ range_last,
++    int32_t* __restrict__ parent_of_internal, int32_t* __restrict__ parent_of_leaf
++) {
++    int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n - 1) return;
++
++    int32_t d = (lbvh_delta(codes, n, i, i + 1) > lbvh_delta(codes, n, i, i - 1)) ? 1 : -1;
++
++    int32_t delta_min = lbvh_delta(codes, n, i, i - d);
++    int32_t lmax = 2;
++    while (lbvh_delta(codes, n, i, i + lmax * d) > delta_min) {
++        lmax <<= 1;
++    }
++
++    int32_t l = 0;
++    for (int32_t t = lmax >> 1; t >= 1; t >>= 1) {
++        if (lbvh_delta(codes, n, i, i + (l + t) * d) > delta_min) {
++            l += t;
++        }
++    }
++    int32_t j = i + l * d;
++
++    int32_t first = (i < j) ? i : j;
++    int32_t last = (i < j) ? j : i;
++    range_first[i] = first;
++    range_last[i] = last;
++
++    int32_t delta_node = lbvh_delta(codes, n, first, last);
++    int32_t split = first;
++    int32_t step = last - first;
++    do {
++        step = (step + 1) >> 1;
++        int32_t new_split = split + step;
++        if (new_split < last && lbvh_delta(codes, n, first, new_split) > delta_node) {
++            split = new_split;
++        }
++    } while (step > 1);
++
++    int32_t left, right;
++    if (split == first) {
++        left = -split - 1; // leaf
++        parent_of_leaf[split] = i;
++    } else {
++        left = split;
++        parent_of_internal[split] = i;
++    }
++    if (split + 1 == last) {
++        right = -(split + 1) - 1; // leaf
++        parent_of_leaf[split + 1] = i;
++    } else {
++        right = split + 1;
++        parent_of_internal[split + 1] = i;
++    }
++
++    left_child[i] = left;
++    right_child[i] = right;
++}
++
++// ---------------------------------------------------------------------------
++// Stage 4: bottom-up AABB refit + subtree-size/collapse decision, using the
++// classic atomic-flag "second thread finishes the node" technique (Karras'
++// NVIDIA blog "Thinking Parallel, Part III"; Apetrei 2014). One thread per
++// leaf climbs toward the root; at each internal node, the *second* thread to
++// arrive (i.e. the one that finds both children ready) computes that node's
++// bbox, decides whether its triangle range is small enough to collapse into
++// a single leaf in the final flat tree (<= n_primitives_per_leaf), and
++// records the flattened subtree size the top-down offset-assignment pass
++// (Stage 5) needs. __threadfence() precedes every completion signal
++// (atomicAdd) so the winning thread's view of its sibling's writes -- made
++// by whichever other thread finished that sibling -- is guaranteed visible.
++// ---------------------------------------------------------------------------
++
++__global__ void lbvh_refit_kernel(
++    int32_t n, const Triangle* __restrict__ triangles_sorted,
++    const int32_t* __restrict__ parent_of_leaf, const int32_t* __restrict__ parent_of_internal,
++    const int32_t* __restrict__ left_child, const int32_t* __restrict__ right_child,
++    const int32_t* __restrict__ range_first, const int32_t* __restrict__ range_last,
++    uint32_t n_primitives_per_leaf,
++    BoundingBox* __restrict__ bbox_internal, uint8_t* __restrict__ is_collapsed,
++    int32_t* __restrict__ flat_size, int32_t* __restrict__ atomic_flags
++) {
++    int32_t leaf = blockIdx.x * blockDim.x + threadIdx.x;
++    if (leaf >= n) return;
++
++    int32_t node = parent_of_leaf[leaf];
++    while (node != -1) {
++        __threadfence();
++        int32_t old = atomicAdd(&atomic_flags[node], 1);
++        if (old == 0) {
++            return; // sibling subtree not ready yet; that thread will finish this node.
++        }
++
++        int32_t a = left_child[node], b = right_child[node];
++        BoundingBox bbox_a = (a >= 0) ? bbox_internal[a] : BoundingBox(triangles_sorted[-a - 1]);
++        BoundingBox bbox_b = (b >= 0) ? bbox_internal[b] : BoundingBox(triangles_sorted[-b - 1]);
++        BoundingBox bbox = bbox_a;
++        bbox.enlarge(bbox_b);
++        bbox_internal[node] = bbox;
++
++        int32_t count = range_last[node] - range_first[node] + 1;
++        bool collapsed = count <= (int32_t)n_primitives_per_leaf;
++        is_collapsed[node] = collapsed ? 1 : 0;
++
++        if (collapsed) {
++            flat_size[node] = 1;
++        } else {
++            int32_t size_a = (a >= 0) ? (is_collapsed[a] ? 1 : flat_size[a]) : 1;
++            int32_t size_b = (b >= 0) ? (is_collapsed[b] ? 1 : flat_size[b]) : 1;
++            flat_size[node] = 1 + size_a + size_b;
++        }
++
++        node = parent_of_internal[node];
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Stage 5: top-down flatten into the final TriangleBvhNode array, processed
++// level by level (BFS). Each launch consumes the current frontier of
++// not-yet-expanded internal nodes (each already assigned a final array
++// index, an escape_idx and a *descendant region* by its parent's launch)
++// and, for each: writes its BoundingBox/escape_idx, places its 2 children in
++// the 2 CONTIGUOUS slots at the start of its descendant region
++// ([left_idx, left_idx+2), which is what TriangleBvhWithBranchingFactor<2>'s
++// stack traversal reads: bvhnodes[node.left_idx + i] for i in {0,1}), and
++// either writes each child directly (true singleton leaf, or a collapsed
++// internal node covering a contiguous triangle range) or enqueues it into
++// the next frontier for its own future expansion.
++//
++// Layout of a node v at final index f with descendant region starting at
++// base (region size = flat_size[v] - 1, i.e. every node of v's subtree
++// except v itself):
++//
++//     base      : child A            (left_idx  = base)
++//     base + 1  : child B            (right_idx = base + 2, exclusive end)
++//     base + 2  : A's descendant region, flat_size[A] - 1 slots
++//     ...       : B's descendant region, flat_size[B] - 1 slots
++//
++// Root: final index 0, descendant region starts at 1, escape_idx -1. This is
++// the same "children first, then the subtrees" layout the host builder's
++// number_and_flatten produces (only the relative order of the two
++// sub-regions differs, which the traversal never depends on).
++//
++// NOTE: a DFS pre-order layout (child B placed *after* child A's entire
++// subtree, right_final = left_final + flat_size[A]) would only be valid for the
++// stackless escape-link walk; the primary stack-based traversal in bvh.cu
++// (closest_triangle / ray_intersect / ...) reads the children contiguously,
++// so both children must be stored next to each other as above.
++//
++// Escape-link semantics mirror the host builder's thread_bvh exactly: a
++// node's first child escapes to its sibling's slot; the last child escapes
++// to the parent's own escape_idx. Root: final index 0, escape_idx -1.
++// ---------------------------------------------------------------------------
++
++__device__ __forceinline__ void lbvh_write_leaf(
++    TriangleBvhNode* __restrict__ out_nodes, int32_t final_idx, int32_t escape,
++    const BoundingBox& bb, int32_t range_begin, int32_t range_end_exclusive
++) {
++    out_nodes[final_idx].bb = bb;
++    out_nodes[final_idx].left_idx = -range_begin - 1;
++    out_nodes[final_idx].right_idx = -range_end_exclusive - 1;
++    out_nodes[final_idx].escape_idx = escape;
++}
++
++__global__ void lbvh_flatten_level_kernel(
++    int32_t frontier_count,
++    const int32_t* __restrict__ frontier_node, const int32_t* __restrict__ frontier_final_idx,
++    const int32_t* __restrict__ frontier_escape, const int32_t* __restrict__ frontier_desc_base,
++    const int32_t* __restrict__ left_child, const int32_t* __restrict__ right_child,
++    const int32_t* __restrict__ range_first, const int32_t* __restrict__ range_last,
++    const BoundingBox* __restrict__ bbox_internal, const uint8_t* __restrict__ is_collapsed, const int32_t* __restrict__ flat_size,
++    const Triangle* __restrict__ triangles_sorted,
++    TriangleBvhNode* __restrict__ out_nodes,
++    int32_t* __restrict__ next_frontier_node, int32_t* __restrict__ next_frontier_final_idx,
++    int32_t* __restrict__ next_frontier_escape, int32_t* __restrict__ next_frontier_desc_base,
++    int32_t* __restrict__ next_frontier_counter
++) {
++    int32_t t = blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= frontier_count) return;
++
++    int32_t node = frontier_node[t];
++    int32_t final_idx = frontier_final_idx[t];
++    int32_t escape = frontier_escape[t];
++    int32_t base = frontier_desc_base[t];
++
++    out_nodes[final_idx].bb = bbox_internal[node];
++    out_nodes[final_idx].escape_idx = escape;
++
++    int32_t a = left_child[node], b = right_child[node];
++    int32_t size_a = (a >= 0) ? (is_collapsed[a] ? 1 : flat_size[a]) : 1;
++
++    // Children are CONTIGUOUS: [base, base + 2). Their own descendant regions
++    // follow: A's at base + 2 (size_a - 1 slots), B's right after A's.
++    const int32_t left_final = base;
++    const int32_t right_final = base + 1;
++    const int32_t desc_base_a = base + 2;
++    const int32_t desc_base_b = desc_base_a + (size_a - 1);
++
++    out_nodes[final_idx].left_idx = left_final;
++    out_nodes[final_idx].right_idx = base + 2; // exclusive end of the children run
++
++    // Child A: first sibling, escapes to child B's slot.
++    if (a < 0) {
++        int32_t leaf_id = -a - 1;
++        lbvh_write_leaf(out_nodes, left_final, right_final, BoundingBox(triangles_sorted[leaf_id]), leaf_id, leaf_id + 1);
++    } else if (is_collapsed[a]) {
++        lbvh_write_leaf(out_nodes, left_final, right_final, bbox_internal[a], range_first[a], range_last[a] + 1);
++    } else {
++        int32_t slot = atomicAdd(next_frontier_counter, 1);
++        next_frontier_node[slot] = a;
++        next_frontier_final_idx[slot] = left_final;
++        next_frontier_escape[slot] = right_final;
++        next_frontier_desc_base[slot] = desc_base_a;
++    }
++
++    // Child B: last sibling, escapes to this node's own escape_idx.
++    if (b < 0) {
++        int32_t leaf_id = -b - 1;
++        lbvh_write_leaf(out_nodes, right_final, escape, BoundingBox(triangles_sorted[leaf_id]), leaf_id, leaf_id + 1);
++    } else if (is_collapsed[b]) {
++        lbvh_write_leaf(out_nodes, right_final, escape, bbox_internal[b], range_first[b], range_last[b] + 1);
++    } else {
++        int32_t slot = atomicAdd(next_frontier_counter, 1);
++        next_frontier_node[slot] = b;
++        next_frontier_final_idx[slot] = right_final;
++        next_frontier_escape[slot] = escape;
++        next_frontier_desc_base[slot] = desc_base_b;
++    }
++}
++
++} // namespace
++
++void build_lbvh_device(
++    GPUMemory<Triangle>& triangles_gpu,
++    GPUMemory<TriangleBvhNode>& nodes_gpu,
++    uint32_t n_primitives_per_leaf,
++    cudaStream_t stream
++) {
++    const int32_t n = (int32_t)triangles_gpu.size();
++    if (n <= (int32_t)n_primitives_per_leaf) {
++        throw std::runtime_error("build_lbvh_device: need more triangles than n_primitives_per_leaf");
++    }
++
++    // --- scene (centroid) AABB ------------------------------------------------
++    const uint32_t reduce_blocks = std::min<uint32_t>(n_blocks((uint32_t)n), 4096u);
++    GPUMemory<Eigen::Vector3f> partial_min(reduce_blocks), partial_max(reduce_blocks);
++    GPUMemory<Eigen::Vector3f> scene_min(1), scene_max(1);
++    centroid_partial_reduce_kernel<<<reduce_blocks, kThreads, 0, stream>>>(
++        (uint32_t)n, triangles_gpu.data(), partial_min.data(), partial_max.data());
++    centroid_final_reduce_kernel<<<1, kThreads, 0, stream>>>(
++        reduce_blocks, partial_min.data(), partial_max.data(), scene_min.data(), scene_max.data());
++
++    // --- Morton codes + index array -------------------------------------------
++    GPUMemory<uint32_t> codes_in(n), indices_in(n);
++    morton_code_kernel<<<n_blocks((uint32_t)n), kThreads, 0, stream>>>(
++        (uint32_t)n, triangles_gpu.data(), scene_min.data(), scene_max.data(), codes_in.data(), indices_in.data());
++
++    // --- sort primitives by Morton code (restricted to the 30 significant bits) ---
++    GPUMemory<uint32_t> codes_out(n), indices_out(n);
++    size_t temp_bytes = 0;
++    LBVH_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        nullptr, temp_bytes, codes_in.data(), codes_out.data(), indices_in.data(), indices_out.data(),
++        n, 0, 30, stream));
++    GPUMemory<uint8_t> temp_storage(temp_bytes);
++    LBVH_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
++        temp_storage.data(), temp_bytes, codes_in.data(), codes_out.data(), indices_in.data(), indices_out.data(),
++        n, 0, 30, stream));
++
++    // --- reorder triangles into Morton order (leaf ranges index into this array) ---
++    GPUMemory<Triangle> triangles_sorted(n);
++    gather_by_permutation_kernel<<<n_blocks((uint32_t)n), kThreads, 0, stream>>>(
++        (uint32_t)n, triangles_gpu.data(), indices_out.data(), triangles_sorted.data());
++
++    // --- Karras binary radix-tree hierarchy -----------------------------------
++    const int32_t n_internal = n - 1;
++    GPUMemory<int32_t> left_child(n_internal), right_child(n_internal);
++    GPUMemory<int32_t> range_first(n_internal), range_last(n_internal);
++    GPUMemory<int32_t> parent_of_internal(n_internal), parent_of_leaf(n);
++    LBVH_CUDA_CHECK(cudaMemsetAsync(parent_of_internal.data(), 0xFF, n_internal * sizeof(int32_t), stream));
++    LBVH_CUDA_CHECK(cudaMemsetAsync(parent_of_leaf.data(), 0xFF, n * sizeof(int32_t), stream));
++    karras_build_kernel<<<n_blocks((uint32_t)n_internal), kThreads, 0, stream>>>(
++        codes_out.data(), n, left_child.data(), right_child.data(),
++        range_first.data(), range_last.data(), parent_of_internal.data(), parent_of_leaf.data());
++
++    // --- bottom-up refit + collapse decision -----------------------------------
++    GPUMemory<BoundingBox> bbox_internal(n_internal);
++    GPUMemory<uint8_t> is_collapsed(n_internal);
++    GPUMemory<int32_t> flat_size(n_internal);
++    GPUMemory<int32_t> atomic_flags(n_internal);
++    LBVH_CUDA_CHECK(cudaMemsetAsync(atomic_flags.data(), 0, n_internal * sizeof(int32_t), stream));
++    LBVH_CUDA_CHECK(cudaMemsetAsync(is_collapsed.data(), 0, n_internal * sizeof(uint8_t), stream));
++    lbvh_refit_kernel<<<n_blocks((uint32_t)n), kThreads, 0, stream>>>(
++        n, triangles_sorted.data(), parent_of_leaf.data(), parent_of_internal.data(),
++        left_child.data(), right_child.data(), range_first.data(), range_last.data(),
++        n_primitives_per_leaf, bbox_internal.data(), is_collapsed.data(), flat_size.data(), atomic_flags.data());
++
++    uint8_t root_collapsed_h = 0;
++    int32_t root_flat_size_h = 1;
++    LBVH_CUDA_CHECK(cudaMemcpyAsync(&root_collapsed_h, is_collapsed.data(), sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
++    LBVH_CUDA_CHECK(cudaMemcpyAsync(&root_flat_size_h, flat_size.data(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++    LBVH_CUDA_CHECK(cudaStreamSynchronize(stream));
++    if (root_collapsed_h) {
++        // Cannot happen given the n > n_primitives_per_leaf guard above (root's range
++        // always spans all n triangles), but guard defensively rather than silently
++        // emitting a degenerate 1-node tree.
++        throw std::runtime_error("build_lbvh_device: root collapsed unexpectedly");
++    }
++    const int32_t total_nodes = root_flat_size_h;
++
++    // --- top-down flatten (BFS by level) ----------------------------------------
++    nodes_gpu.resize((size_t)total_nodes);
++
++    GPUMemory<int32_t> frontier_node(total_nodes), frontier_final_idx(total_nodes), frontier_escape(total_nodes), frontier_desc_base(total_nodes);
++    GPUMemory<int32_t> next_frontier_node(total_nodes), next_frontier_final_idx(total_nodes), next_frontier_escape(total_nodes), next_frontier_desc_base(total_nodes);
++    GPUMemory<int32_t> frontier_counter(1);
++
++    // Root: final index 0, escape -1, its descendants occupy [1, total_nodes).
++    const int32_t root_seed_node = 0, root_seed_final = 0, root_seed_escape = -1, root_seed_desc_base = 1;
++    LBVH_CUDA_CHECK(cudaMemcpyAsync(frontier_node.data(), &root_seed_node, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
++    LBVH_CUDA_CHECK(cudaMemcpyAsync(frontier_final_idx.data(), &root_seed_final, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
++    LBVH_CUDA_CHECK(cudaMemcpyAsync(frontier_escape.data(), &root_seed_escape, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
++    LBVH_CUDA_CHECK(cudaMemcpyAsync(frontier_desc_base.data(), &root_seed_desc_base, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
++
++    int32_t frontier_count = 1;
++    const int32_t kMaxLevels = 64; // generous bound; balanced tree depth is ~log2(n) << this.
++    int32_t level = 0;
++    for (; level < kMaxLevels && frontier_count > 0; ++level) {
++        LBVH_CUDA_CHECK(cudaMemsetAsync(frontier_counter.data(), 0, sizeof(int32_t), stream));
++        lbvh_flatten_level_kernel<<<n_blocks((uint32_t)frontier_count), kThreads, 0, stream>>>(
++            frontier_count,
++            frontier_node.data(), frontier_final_idx.data(), frontier_escape.data(), frontier_desc_base.data(),
++            left_child.data(), right_child.data(), range_first.data(), range_last.data(),
++            bbox_internal.data(), is_collapsed.data(), flat_size.data(),
++            triangles_sorted.data(), nodes_gpu.data(),
++            next_frontier_node.data(), next_frontier_final_idx.data(), next_frontier_escape.data(), next_frontier_desc_base.data(),
++            frontier_counter.data());
++        int32_t next_count = 0;
++        LBVH_CUDA_CHECK(cudaMemcpyAsync(&next_count, frontier_counter.data(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++        LBVH_CUDA_CHECK(cudaStreamSynchronize(stream));
++        std::swap(frontier_node, next_frontier_node);
++        std::swap(frontier_final_idx, next_frontier_final_idx);
++        std::swap(frontier_escape, next_frontier_escape);
++        std::swap(frontier_desc_base, next_frontier_desc_base);
++        frontier_count = next_count;
++    }
++    if (frontier_count > 0) {
++        throw std::runtime_error("build_lbvh_device: flatten BFS exceeded max depth");
++    }
++
++    triangles_gpu = std::move(triangles_sorted);
++}
++
++} // namespace cubvh
++} // namespace fastpixal3d_cubvh_ns

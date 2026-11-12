@@ -1,0 +1,14 @@
+# Paper row: (control) + side-stream texture sampling, early PNG, with the fine-shape LoRA fold
+# Cumulative measurement, control of row 13 (texture_side_stream); runs with the chain, not part of it.
+# Not a step of the chain. Row 13 with fold_lora_fine_shape on, which has nothing to act on while Pixal3D's
+# 12-step fine-shape flow runs (no fine-shape student is loaded); this row minus row 13 checks that (a note
+# to the report's cumulative tables).
+name: fold_lora_with_released_fine_shape_flow
+method: fast
+control_of: texture_side_stream
+adds: [fold_lora_fine_shape]
+removes: []
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, adaptive_remesh,
+  lean_glb_writer, gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers,
+  fa3_texture_flow, texture_kv_reuse, shared_conditioning, fa3_fine_shape_flow, texture_side_stream,
+  fold_lora_fine_shape]

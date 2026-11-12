@@ -1,0 +1,17 @@
+# Environment of the measured configuration: Python 3.10, PyTorch 2.7.0 + CUDA 12.8.
+#   conda env create -f env/environment.yml && conda activate fastpixal3d
+# then build the source dependencies with env/install.sh (it also creates this environment if needed).
+name: fastpixal3d
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.10.21
+  - pip
+  - git
+  - ninja
+  - cuda-nvcc=12.8          # CUDA compiler for the source builds (FlexGEMM, CuMesh, o-voxel, nvdiffrast, FlashAttention)
+  - cuda-cudart-dev=12.8
+  - cuda-libraries-dev=12.8
+  - pip:
+      - -r requirements-runtime.lock

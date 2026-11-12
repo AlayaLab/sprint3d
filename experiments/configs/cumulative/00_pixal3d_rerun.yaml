@@ -1,0 +1,8 @@
+# Paper row: Pixal3D re-run
+# Cumulative measurement, row 00 of 00-18 (file order = order of the measurement).
+# Pixal3D's own inference script at its defaults (1,000,000 faces, 4096 x 4096 texture, WebP textures),
+# unmodified (fastpixal3d.official): the reference row of the waterfall. Its four flows sample with 12
+# steps.
+name: pixal3d_rerun
+method: official
+adds: []

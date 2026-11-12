@@ -1,0 +1,84 @@
+diff --git a/utils3d/__init__.py b/utils3d/__init__.py
+index 3291ba3..df1148c 100644
+--- a/utils3d/__init__.py
++++ b/utils3d/__init__.py
+@@ -9,12 +9,16 @@ try:
+ except ImportError:
+     pass
+ 
+-__all__ = ['numpy', 'torch', 'io']
++__all__ = ['numpy', 'torch', 'io', 'pt']
+ 
+ def __getattr__(name: str):
++    # 'pt' is an alias for 'torch', compatible with MoGe v2
++    if name == 'pt':
++        return importlib.import_module('.torch', __package__)
+     return globals().get(name, importlib.import_module(f'.{name}', __package__)) 
+ 
+ if TYPE_CHECKING:
+     from . import torch
++    from . import torch as pt  # alias for MoGe v2 compatibility
+     from . import numpy
+     from . import io
+\ No newline at end of file
+diff --git a/utils3d/torch/__init__.py b/utils3d/torch/__init__.py
+index bffcf41..e2e0108 100644
+--- a/utils3d/torch/__init__.py
++++ b/utils3d/torch/__init__.py
+@@ -50,6 +50,7 @@ __modules_all__ = {
+         'chessboard',
+         'depth_edge',
+         'depth_aliasing',
++        'depth_map_to_point_map',
+         'image_mesh_from_depth',
+         'point_to_normal',
+         'depth_to_normal',
+diff --git a/utils3d/torch/utils.py b/utils3d/torch/utils.py
+index 877ffb8..2ee7d44 100644
+--- a/utils3d/torch/utils.py
++++ b/utils3d/torch/utils.py
+@@ -23,7 +23,8 @@ __all__ = [
+     'depth_to_normal',
+     'masked_min',
+     'masked_max',
+-    'bounding_rect'
++    'bounding_rect',
++    'depth_map_to_point_map',
+ ]
+ 
+ 
+@@ -331,6 +332,34 @@ def bounding_rect(mask: torch.BoolTensor):
+     return torch.cat([left_top, right_bottom], dim=-1)
+ 
+ 
++def depth_map_to_point_map(
++    depth: torch.Tensor,
++    intrinsics: torch.Tensor,
++    extrinsics: torch.Tensor = None,
++) -> torch.Tensor:
++    """
++    Unproject depth map to 3D point map.
++
++    Args:
++        depth (torch.Tensor): [..., height, width] depth map
++        intrinsics (torch.Tensor): [..., 3, 3] camera intrinsics matrix (normalized, OpenCV convention)
++        extrinsics (torch.Tensor): [..., 4, 4] camera extrinsics matrix (optional)
++
++    Returns:
++        points (torch.Tensor): [..., height, width, 3] 3D point map
++    """
++    height, width = depth.shape[-2:]
++    uv = image_uv(height, width, device=depth.device, dtype=depth.dtype)  # (H, W, 2)
++    pts = transforms.unproject_cv(
++        uv.reshape(-1, 2),
++        depth.reshape(*depth.shape[:-2], -1),
++        extrinsics=extrinsics[..., None, :, :] if extrinsics is not None else None,
++        intrinsics=intrinsics[..., None, :, :],
++    )
++    pts = pts.reshape(*depth.shape[:-2], height, width, 3)
++    return pts
++
++
+ def chessboard(width: int, height: int, grid_size: int, color_a: torch.Tensor, color_b: torch.Tensor) -> torch.Tensor:
+     """get a chessboard image
+ 

@@ -1,0 +1,242 @@
+{
+  "format": 1,
+  "note": "Files are stored under <root>/<local_dir>/<path>; <root> defaults to the directory of this file.",
+  "sources": [
+    {
+      "name": "students",
+      "kind": "huggingface",
+      "repo": "AlayaLab/sprint3d",
+      "revision": "6c3864784f21a5da225ea2a78563f66f676228c5",
+      "local_dir": "students",
+      "role": "EMA LoRA of the four students (structure, coarse shape, fine shape, texture) and students.json",
+      "license": "CC BY-NC 4.0 (proposed)",
+      "files": [
+        {
+          "path": "students.json",
+          "size": 6362,
+          "sha256": "310db80728d8f0ff5c95ae73ce43bb3c544a0560d7812ba339e099683cd311e5"
+        },
+        {
+          "path": "structure_student.safetensors",
+          "size": 1274085008,
+          "sha256": "a938130271c96eaaf67643bb428aa2aa8e53033b09608ea3eedc5531d9b97396"
+        },
+        {
+          "path": "coarse_shape_student.safetensors",
+          "size": 1305542328,
+          "sha256": "59be306522816b4d1defa525cfecf3f9666a161902b245fee387cd7a34fb9a66"
+        },
+        {
+          "path": "fine_shape_student.safetensors",
+          "size": 1305542328,
+          "sha256": "6beb37c82f5f618f84d9bc988564d41e3971ff85c42ef06217e580186e7dd583"
+        },
+        {
+          "path": "texture_student.safetensors",
+          "size": 1305542328,
+          "sha256": "ecc4ae096358120cde9ef2a6bbdff8bfee5c04e5f3bc49db84183d0f7d37887c"
+        }
+      ]
+    },
+    {
+      "name": "pixal3d",
+      "kind": "huggingface",
+      "repo": "TencentARC/Pixal3D",
+      "revision": "0b31f9160aa400719af409098bff7936a932f726",
+      "local_dir": "pixal3d",
+      "role": "base model: pipeline config, the flow models the students adapt, decoders",
+      "license": "MIT",
+      "access": "gated in the EU",
+      "files": [
+        {
+          "path": "LICENSE",
+          "size": 1064,
+          "sha256": "31d37e9c4fee1e0cd2196bccd592e8a2c30bfa17ea177d70ad25f977ba6bd9c0"
+        },
+        {
+          "path": "NOTICE",
+          "size": 12527,
+          "sha256": "2d9c4437b2c3264dcea406c6af5066c0b21c7a7b34384c567dc6551b9129f815"
+        },
+        {
+          "path": "pipeline.json",
+          "size": 4068,
+          "sha256": "1647217de06e32477702d14895e826fea73497d94537b809a53637f13482a237"
+        },
+        {
+          "path": "ckpts/ss_flow_img_dit_1_3B_64_bf16.json",
+          "size": 503,
+          "sha256": "2b3ef4c63b72a3de8adf745bd9d9d36b7960bdd7ba3740a6fa4d18fea6c475dd"
+        },
+        {
+          "path": "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+          "size": 5359822584,
+          "sha256": "6d0147bb347eb61fa81c304cc68c7fd69d447e91870357a549b47e1d0fd77242"
+        },
+        {
+          "path": "ckpts/ss_dec_conv3d_16l8_fp16.json",
+          "size": 245,
+          "sha256": "646781293f1cda74720de85d1cef50a957fb4aebd9a4bd014e454e32f2330ac5"
+        },
+        {
+          "path": "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+          "size": 147591972,
+          "sha256": "1c76d4a40519aa2d711cc263a8404105231ac26db31d946bed48b84fee79009a"
+        },
+        {
+          "path": "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.json",
+          "size": 535,
+          "sha256": "2f7b736e8535aae96e7c41e8d123c24a14ee809fc25bea76eeac72643d21b997"
+        },
+        {
+          "path": "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+          "size": 5546764048,
+          "sha256": "63569838c1da93f010e2fa805b202ecf802cc758830230abac202a81b70e5b45"
+        },
+        {
+          "path": "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json",
+          "size": 535,
+          "sha256": "f47fca56311959a643e8cfd2750229a2c53cbab0027406d8426cd564ce4fb5bc"
+        },
+        {
+          "path": "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+          "size": 5546764048,
+          "sha256": "3e6d1df0e62bc5bc863320d1d63d6b996235eef4abb8b851e878c88f316369f1"
+        },
+        {
+          "path": "ckpts/shape_dec_next_dc_f16c32_fp16.json",
+          "size": 678,
+          "sha256": "5f1b856dffce79466fb18f5f0eefc08f08c673b24b3c05b20359c0b6d318a209"
+        },
+        {
+          "path": "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors",
+          "size": 948490494,
+          "sha256": "e3b718d3e43e4f8780e9a24ac6fff231811a67e3b058e336e10fe654c911d581"
+        },
+        {
+          "path": "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json",
+          "size": 535,
+          "sha256": "f18455729d08d2ce7ef809f947ffa47f6f468b3bcf8a86473e8c326e80128ac2"
+        },
+        {
+          "path": "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+          "size": 5546960656,
+          "sha256": "65df179ad02f9e92bc18335d7861fadd95f268e6249217352468dd83cb79d1d0"
+        },
+        {
+          "path": "ckpts/tex_dec_next_dc_f16c32_fp16.json",
+          "size": 705,
+          "sha256": "22074e4ab5b28e2b72d33a3fe61bf416134b89e12d0fc5c729f37da75da0c4d1"
+        },
+        {
+          "path": "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
+          "size": 948458812,
+          "sha256": "97ea69addea2ecd9312910f5f548234665eef51c088386180b7cd5b258645e3c"
+        }
+      ]
+    },
+    {
+      "name": "dinov3",
+      "kind": "huggingface",
+      "repo": "camenduru/dinov3-vitl16-pretrain-lvd1689m",
+      "revision": "3c276edd87d6f6e569ff0c4400e086807d0f3881",
+      "local_dir": "dinov3",
+      "role": "DINOv3 ViT-L/16 image encoder for conditioning; mirror of facebook/dinov3-vitl16-pretrain-lvd1689m, the id used by the Pixal3D inference code",
+      "license": "DINOv3 License",
+      "files": [
+        {
+          "path": "LICENSE.md",
+          "size": 7503,
+          "sha256": "25d122eb8f5b880fd23c736fb6ea8018ee45c12237e00b8a86d14c653904999e"
+        },
+        {
+          "path": "config.json",
+          "size": 745,
+          "sha256": "135ecd23e34a70b6fbed8b083fdecb319b7e3a54e3d849258bbe4ddcf1783bb5"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size": 585,
+          "sha256": "960c41d1f3a7778b936365769a2d90550b318a6c0a53a0296957adacfe5e0dd7"
+        },
+        {
+          "path": "model.safetensors",
+          "size": 1212559808,
+          "sha256": "dcb2e45127cccbf1601e5f42fef165eea275c8e5213197e8dcf3f48822718179"
+        }
+      ]
+    },
+    {
+      "name": "moge2",
+      "kind": "huggingface",
+      "repo": "Ruicheng/moge-2-vitl",
+      "revision": "39c4d5e957afe587e04eec59dc2bcc3be5ecd968",
+      "local_dir": "moge2",
+      "role": "MoGe-2 ViT-L, field-of-view estimate for the camera",
+      "license": "MIT",
+      "files": [
+        {
+          "path": "model.pt",
+          "size": 1305030700,
+          "sha256": "3eefd4abb2102f38f12b2d1992e5ff15e4923e5431c67dd494afe157e0111cd5"
+        }
+      ]
+    },
+    {
+      "name": "rmbg2",
+      "kind": "huggingface",
+      "repo": "briaai/RMBG-2.0",
+      "revision": "5df4c9c76d8170882c34f6986e848ee07fd0ba43",
+      "local_dir": "rmbg2",
+      "role": "background removal, used only for input images without an alpha channel",
+      "license": "CC BY-NC 4.0",
+      "access": "gated (accept the terms on the model page)",
+      "files": [
+        {
+          "path": "config.json",
+          "size": 405,
+          "sha256": "c97ea21569daf66b205491a4635147dd3bc42c7c168b89d7d75b53f67ef548ae"
+        },
+        {
+          "path": "BiRefNet_config.py",
+          "size": 298,
+          "sha256": "e7b8c2a74f6cea6a59553d517f71d47f2c1d90e670a13416af17c25fe2f3dc52"
+        },
+        {
+          "path": "birefnet.py",
+          "size": 91403,
+          "sha256": "e499d75224b8819e985e68fb78b7a8e8c99316840474e74e16b5529f03ca2860"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size": 391,
+          "sha256": "447d9ccb2c4129ab0ca045fc293e7d79dbc45e293ac1e94818d865db77f65a54"
+        },
+        {
+          "path": "model.safetensors",
+          "size": 884878856,
+          "sha256": "566ed80c3d95f87ada6864d4cbe2290a1c5eb1c7bb0b123e984f60f76b02c3a7"
+        }
+      ]
+    },
+    {
+      "name": "naf",
+      "kind": "url",
+      "url": "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth",
+      "local_dir": "naf",
+      "code": {
+        "repo": "valeoai/NAF",
+        "commit": "37f2dfc180f2de53d98bd601109c0da0dd6b0f43"
+      },
+      "role": "NAF feature upsampler weights; the model code is loaded with torch.hub at the pinned commit",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "naf_release.pth",
+          "size": 2664431,
+          "sha256": "c096c1ab2217a5c3ac136365f721685e2201379cb69d509cfb0261183847c98f"
+        }
+      ]
+    }
+  ]
+}

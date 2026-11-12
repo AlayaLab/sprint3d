@@ -1,0 +1,69 @@
+# Paths of the cache builders in train/caches/. Copy this file (e.g. to train/configs/caches.yaml),
+# set the paths, and pass it with --config. Relative paths are resolved against the directory of the
+# configuration file. Chains (docs/TRAINING.md):
+#
+#   structure student (5k set):  structure_conditioning -> structure_anchors
+#   texture student  (10k set):  structure_conditioning -> fine_shape_conditioning -> fine_shape_anchors
+#                                -> texture_anchors
+#   shape students   (5k set):   shape_conditioning_wild (coarse_shape_conditioning_wild and
+#                                fine_shape_conditioning_wild, from the objects' conditioning images)
+#
+# Every builder writes one <view>.pt record per rendered view (shape_conditioning_wild.py: one <id>.pt
+# record per object) into caches.<cache>.<dataset>, skips views that already have a record, and can be
+# split over processes with --shard i --nshard n.
+
+pixal3d:
+  model: null      # Pixal3D weights: local directory or Hugging Face repository id
+                   # (null: $FASTPIXAL3D_PIXAL3D, else TencentARC/Pixal3D at the pinned revision)
+  source: null     # Pixal3D source checkout (null: $FASTPIXAL3D_PIXAL3D_SRC, else third_party/Pixal3D)
+
+runtime:
+  device: cuda
+  threads: 4
+  tf32_override: true   # TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, as in the runs that built the caches
+
+datasets:
+  # Renders, transforms and mesh dumps in the Pixal3D data-toolkit layout:
+  #   <root>/<subset dir>/renders_cond/<sha256>/{000.png, 001.png, transforms.json}
+  #   <root>/<subset dir>/mesh_dumps/<sha256>.pickle
+  curated_10k:
+    root: /path/to/curated_10k
+    subset_dirs: {sketchfab: ObjaverseXL_sketchfab, 3dfuture: 3D-FUTURE, hssd: HSSD, abo: ABO}
+    list: ../../data/lists/curated_10k.csv   # or matched_5243.csv
+    key: sha256                              # view names <sha256>.view00, <sha256>.view01
+    views: [0, 1]
+  train_5k:
+    root: /path/to/train_5k                  # flat layout: <root>/renders_cond/<sha256>/..., <root>/mesh_dumps/...
+    subset_dirs: {}
+    list: ../../data/lists/train_5k.csv
+    key: id                                  # view names <id>.view00, <id>.view01 (the render directory is <sha256>)
+    views: [0, 1]
+  train_5k_images:
+    # The conditioning images of the 5k set, one per object: <root>/<subset dir>/<id>/image.png
+    # (shape_conditioning_wild.py; the shape students were trained on these images)
+    root: /path/to/5k_balanced
+    subset_dirs: {sketchfab: objaverse_sketchfab, hssd: hssd}
+    list: ../../data/lists/train_5k.csv
+    key: id
+    views: []
+    image_name: image.png
+
+caches:
+  structure_conditioning:
+    curated_10k: /path/to/cache/structure_conditioning_10k
+    train_5k: /path/to/cache/structure_conditioning_5k
+  structure_anchors:
+    curated_10k: null
+    train_5k: /path/to/cache/structure_anchors_5k
+  coarse_shape_conditioning:                 # optional by-product of fine_shape_conditioning (null: not written)
+    curated_10k: null
+  fine_shape_conditioning:
+    curated_10k: /path/to/cache/fine_shape_conditioning_10k
+  fine_shape_anchors:
+    curated_10k: /path/to/cache/fine_shape_anchors_10k
+  texture_anchors:
+    curated_10k: /path/to/cache/texture_anchors_10k
+  coarse_shape_conditioning_wild:            # shape students: train/caches/shape_conditioning_wild.py --stage both
+    train_5k_images: /path/to/cache/coarse_shape_conditioning_wild_5k
+  fine_shape_conditioning_wild:
+    train_5k_images: /path/to/cache/fine_shape_conditioning_wild_5k

@@ -1,0 +1,34 @@
+# Inputs and work directory of the 10k-set selection (docs/DATA.md, "Selection of the 10k set").
+# Copy this file (e.g. to data/select/config.yaml), set the paths and run data/select/run_all.sh with it.
+# Relative paths are resolved against the directory of this file. All inputs are read only.
+
+inputs:
+  # TRELLIS-500K metadata (Hugging Face dataset JeffreyXiang/TRELLIS-500K, revision 288b0611):
+  # ObjaverseXL_sketchfab.csv, HSSD.csv, ABO.csv, 3D-FUTURE.csv, Toys4k.csv
+  # (columns sha256, file_identifier, aesthetic_score, captions).
+  trellis_metadata: /path/to/TRELLIS-500K/metadata
+  # Table that maps every ObjaverseXL_sketchfab object of TRELLIS-500K to its Objaverse 1.0 record and
+  # GLB file: columns uid, sha256 (join key), object_path (relative to raw.ObjaverseXL_sketchfab),
+  # face_count, vertex_count, glb_size, archive_glb_size, license (CSV, may be gzip-compressed).
+  sketchfab_manifest: /path/to/trellis_sketchfab_objects.csv.gz
+  # Objaverse 1.0 annotations (allenai/objaverse): metadata/000-*.json.gz and lvis-annotations.json.gz.
+  objaverse_metadata: /path/to/objaverse-1.0
+  # Raw assets (read for file headers, OBJ line counts and file existence only).
+  raw:
+    ObjaverseXL_sketchfab: /path/to/objaverse-1.0/hf-objaverse-v1
+    HSSD: /path/to/TRELLIS-500K/raw/HSSD
+    ABO: /path/to/TRELLIS-500K/raw/ABO/3dmodels/original
+    3D-FUTURE: /path/to/TRELLIS-500K/raw/3D-FUTURE
+  # Optional further Toys4K object lists (CSV with a sha256 column) whose objects are excluded like
+  # the Toys4k.csv objects, e.g. the list of an evaluation subset.
+  extra_toys4k_lists: []
+  # Optional Toys4K evaluation subset for the caption-neighbour audit (CSV with object_id and category;
+  # object_id is the second component of the Toys4k.csv file_identifier). null: audit skipped.
+  toys4k_audit_list: null
+  # The earlier 5k training set (for the overlap columns): data/lists/train_5k.csv.
+  earlier_5k_list: ../lists/train_5k.csv
+  # Blind labels of the precision estimate (blind_key.csv, blind_labels.csv); not distributed.
+  precision_dir: null
+
+work_dir: /path/to/selection_work   # intermediate pickles and the outputs (out/)
+processes: 4                        # worker processes for the metadata and header scans

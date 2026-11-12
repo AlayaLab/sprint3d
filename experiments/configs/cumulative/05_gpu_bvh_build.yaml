@@ -1,0 +1,9 @@
+# Paper row: + GPU BVH build
+# Cumulative measurement, row 05 of 00-18 (file order = order of the measurement); block: mesh
+# post-processing (rows 01-08).
+# Patched cubvh (native/): the BVH is built on the GPU; no host BVH build is used from here on.
+name: gpu_bvh_build
+method: fast
+block: post_processing
+adds: [gpu_bvh_build]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build]

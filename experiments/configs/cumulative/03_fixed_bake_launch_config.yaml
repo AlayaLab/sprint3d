@@ -1,0 +1,8 @@
+# Paper row: + fixed bake-kernel launch configuration
+# Cumulative measurement, row 03 of 00-18 (file order = order of the measurement); block: mesh
+# post-processing (rows 01-08).
+name: fixed_bake_launch_config
+method: fast
+block: post_processing
+adds: [fixed_bake_launch_config]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config]

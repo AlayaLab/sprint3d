@@ -1,0 +1,52 @@
+# Structure student: trajectory distillation of Pixal3D's sparse-structure flow (4 steps).
+# Run:  python train/structure_traj/train.py --config train/configs/structure_student.yaml
+# The values below are those of the released student (docs/TRAINING.md); set the three paths marked
+# "set me" first. Relative paths are resolved against the directory of this file.
+
+model:
+  pixal3d: null                 # Pixal3D weights: local directory or Hugging Face repository id
+                                # (null: $FASTPIXAL3D_PIXAL3D, else TencentARC/Pixal3D at the pinned revision)
+  pixal3d_src: null             # Pixal3D source checkout (null: $FASTPIXAL3D_PIXAL3D_SRC, else third_party/Pixal3D)
+  base_submodel: ckpts/ss_flow_img_dit_1_3B_64_bf16
+  gradient_checkpointing: true
+
+lora:
+  rank: 256
+  alpha: 256.0
+  dropout: 0.0
+
+schedule:
+  teacher_steps: 12             # the teacher's grid: t = 3s / (1 + 2s), s = linspace(1, 0, 13)
+  rescale_t: 3.0
+  grid_indices: [0, 3, 6, 8, 12]  # student grid t = 1.0, 0.9, 0.75, 0.6, 0.0 (4 steps)
+
+data:
+  anchors: /path/to/cache/structure_anchors_5k              # set me (train/caches/structure_anchors.py)
+  conditioning: /path/to/cache/structure_conditioning_5k    # set me (train/caches/structure_conditioning.py)
+  views: ../../data/lists/train_5k.csv                      # 5,243 objects x 2 views = 10,486 views
+  view_key: id
+  view_indices: [0, 1]
+  max_views: null
+
+optim:
+  updates: 500
+  grad_accum: 4                 # 1 process x 4 micro-batches per update
+  lr: 1.0e-4                    # constant, no warm-up
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  grad_clip: 10.0               # global norm over the adapters
+  ema_decay: 0.99               # EMA of the adapters (the released weights)
+  seed: 20260915
+  autocast: bfloat16
+
+output:
+  dir: /path/to/runs/structure_student                     # set me
+  checkpoint_every: 250
+  log_every: 10
+  resume: auto                  # auto: continue from the newest checkpoint in output.dir; none; or a path
+
+runtime:
+  device: cuda
+  tf32_override: true           # TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, as in the training runs
+  threads: 4
+  max_minutes: null

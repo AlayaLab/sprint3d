@@ -1,0 +1,58 @@
+{
+ "schema": "baseline_frame_maps",
+ "convention": "row vectors, v_out = v_glb @ M. canonical: v_world = v_glb @ matrix. camera-referenced methods: v_axes = v_glb @ diag(1, 1, depth_sign), then view_aligned: v_world = v_axes @ R_view (full ground-truth camera rotation) or azimuth_aligned: v_world = v_axes @ R_az (rows = camera right, world up, right x up: gravity-up frame turned to the camera azimuth only). Then own-bbox normalisation in ground-truth world axes (max extent 1, bbox-centred) for every method. Fixed once per method, never per sample; no yaw search, no ICP, no ground-truth-derived scaling. depth_sign +1: the GLB's +z points toward the camera.",
+ "sources": {
+  "trellis2": "the official exporter writes (x, y, z) -> (x, z, -y); inverse v_world = v_glb @ [[1,0,0],[0,0,1],[0,-1,0]]",
+  "camera_referenced": "the GLB carries no node transform and its x-y projection matches the input view; family and depth sign chosen once per method on 15 validation objects (lowest mean Chamfer and angular error)"
+ },
+ "methods": {
+  "trellis2": {
+   "display": "TRELLIS.2",
+   "family": "canonical",
+   "matrix": [
+    [
+     1.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ],
+    [
+     0.0,
+     -1.0,
+     0.0
+    ]
+   ],
+   "geometry_file": "model.glb",
+   "textured_file": "model.glb",
+   "textured": true
+  },
+  "triposg": {
+   "display": "TripoSG",
+   "family": "view_aligned",
+   "depth_sign": 1,
+   "geometry_file": "model.glb",
+   "textured_file": null,
+   "textured": false
+  },
+  "hunyuan3d21": {
+   "display": "Hunyuan3D-2.1",
+   "family": "azimuth_aligned",
+   "depth_sign": 1,
+   "geometry_file": "shape_untextured.glb",
+   "textured_file": "model.glb",
+   "textured": true
+  },
+  "direct3d_s2": {
+   "display": "Direct3D-S2",
+   "family": "view_aligned",
+   "depth_sign": 1,
+   "geometry_file": "model.glb",
+   "textured_file": null,
+   "textured": false
+  }
+ }
+}

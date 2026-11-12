@@ -1,0 +1,9 @@
+# Paper row: Structure (4)
+# One student replaced by its same-step teacher: Pixal3D's structure flow, 4 Euler steps on the
+# structure student's grid t = (1, 0.9, 0.75, 0.6, 0) (indices 0, 3, 6, 8, 12 of the 12-step grid at
+# time rescale 3), conditional prediction only (4 forward passes), from the same initial noise.
+# Texture projection reuse is off in this row, as in the measurement (it does not change the output).
+name: structure_4_steps
+method: fast
+levers: {structure_student: false, texture_projection_reuse: false}
+sampling: {teacher_structure_grid_indices: [0, 3, 6, 8, 12], teacher_structure_guidance: false}

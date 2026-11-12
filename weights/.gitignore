@@ -1,0 +1,4 @@
+# downloaded weights stay out of git; only the pinned source list is tracked
+*
+!.gitignore
+!sources.json

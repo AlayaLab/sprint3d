@@ -1,0 +1,7 @@
+# Paper row: Coarse shape (1)
+# One student replaced by its same-step teacher: Pixal3D's coarse-shape flow, one Euler step from
+# t = 1 to 0, conditional prediction only (one forward pass).
+name: coarse_shape_1_step
+method: fast
+levers: {coarse_shape_student: false}
+sampling: {teacher_shape_steps: 1, teacher_shape_guidance: false}

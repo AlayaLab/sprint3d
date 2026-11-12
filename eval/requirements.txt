@@ -1,0 +1,25 @@
+# Python packages of the evaluation (versions of the measurement environment; Python 3.10).
+# torch / torchvision: install the CUDA 12.8 wheels first, e.g.
+#   pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+# nvdiffrast 0.4.0 is built from source (https://github.com/NVlabs/nvdiffrast, NVIDIA Source Code License,
+# non-commercial use; version 0.4.0 was used): pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
+numpy==2.2.6
+scipy==1.15.3
+trimesh==4.12.2
+pillow==12.2.0
+pyyaml==6.0.3
+lpips==0.1.4
+# appendix metrics (CLIP / CLIP-N, ULIP-2, Uni3D, DINOv2)
+transformers==4.57.3
+tokenizers==0.22.2
+huggingface_hub==0.36.2
+safetensors==0.7.0
+open_clip_torch==3.3.0
+timm==1.0.27
+easydict==1.13
+ftfy==6.3.1
+regex==2026.5.9
+termcolor==3.3.0
+matplotlib==3.10.9
+# tests
+pytest

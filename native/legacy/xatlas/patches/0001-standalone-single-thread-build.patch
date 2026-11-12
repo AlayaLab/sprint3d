@@ -1,0 +1,27 @@
+diff --git a/third_party/xatlas/setup.py b/third_party/xatlas/setup.py
+new file mode 100644
+index 0000000..f572c16
+--- /dev/null
++++ b/third_party/xatlas/setup.py
+@@ -0,0 +1,21 @@
++# Standalone build of the bundled xatlas with its internal thread pool disabled
++# (XA_MULTITHREADED=0): every Atlas runs compute_charts / pack_charts on the calling
++# thread. Used by the per-tile single-thread unwrapping of the tiled mesh path, where
++# 16 Atlases already run concurrently on a thread pool. The C++ namespace is renamed
++# by the build script before this file is used, so the module can be imported next
++# to CuMesh's own xatlas extension.
++from setuptools import setup
++from torch.utils.cpp_extension import BuildExtension, CppExtension
++
++setup(
++    name="fastpixal3d_xatlas_single",
++    version="0.0.1",
++    ext_modules=[
++        CppExtension(
++            name="fastpixal3d_xatlas_single",
++            sources=["xatlas.cpp", "binding.cpp"],
++            extra_compile_args=["-O3", "-std=c++17", "-DXA_MULTITHREADED=0", "-fvisibility=hidden"],
++        )
++    ],
++    cmdclass={"build_ext": BuildExtension},
++)

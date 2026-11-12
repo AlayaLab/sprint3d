@@ -1,0 +1,22 @@
+Sprint3D
+Copyright 2026 Alaya Lab
+
+This product includes software developed at Alaya Lab.
+
+Sprint3D is built on, and runs, the released Pixal3D pipeline (Copyright (c) 2026
+Tencent, MIT License) and the TRELLIS.2 backbone and export code (Copyright (c)
+Microsoft Corporation, MIT License). Those projects are not bundled: they are fetched
+by the user as pinned git submodules and model repositories (SUBMODULES.md,
+weights/sources.json). Sprint3D is not affiliated with, endorsed by, or reviewed by
+Tencent, Microsoft or the authors of those projects.
+
+native/ contains patch series against two third-party libraries, applied at build
+time to pinned upstream commits: CuMesh (Copyright (c) 2025 Jianfeng Xiang, MIT
+License) and cubvh (Copyright (c) 2022 kiui, MIT License, and NVIDIA Source Code
+License for the NVIDIA-derived parts). The patch files contain fragments of those
+libraries; the upstream licence files are kept next to the patches and the built
+extensions remain subject to those licences in addition to this project's.
+
+Third-party libraries, model weights (Pixal3D, DINOv3, MoGe-2, RMBG-2.0, NAF) and
+datasets are obtained separately by users and remain subject to their own terms;
+see THIRD_PARTY_LICENSES.md and the licence texts in LICENSES/.

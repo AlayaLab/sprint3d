@@ -1,0 +1,97 @@
+diff --git a/cubvh/api.py b/cubvh/api.py
+index 3ad94af..e6652d3 100644
+--- a/cubvh/api.py
++++ b/cubvh/api.py
+@@ -20,6 +20,13 @@ class cuBVH():
+         # check inputs
+         assert triangles.shape[0] > 8, "BVH needs at least 8 triangles."
+         
++        # Bind directly to the C++ side's expected dtypes (Verts = float32,
++        # Trigs = uint32) so pybind11/Eigen's Ref<const T> aliases these
++        # buffers as-is instead of silently materializing a dtype-cast copy
++        # (e.g. float64->float32 or int64->uint32) on every call.
++        vertices = np.ascontiguousarray(vertices, dtype=np.float32)
++        triangles = np.ascontiguousarray(triangles, dtype=np.uint32)
++
+         # implementation
+         self.impl = _backend.create_cuBVH(vertices, triangles)
+ 
+diff --git a/include/gpu/gpu_memory.h b/include/gpu/gpu_memory.h
+index 772f809..fa68e91 100644
+--- a/include/gpu/gpu_memory.h
++++ b/include/gpu/gpu_memory.h
+@@ -32,7 +32,10 @@
+ #pragma once
+ 
+ #include <gpu/common.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <algorithm>
+ #include <atomic>
++#include <cstring>
+ #include <stdexcept>
+ #include <stdint.h>
+ #include <string>
+@@ -225,7 +228,62 @@ public:
+     /// Copy data of num_elements from the raw pointer on the host
+     void copy_from_host(const T* host_data, const size_t num_elements) {
+         try {
+-            CUDA_CHECK_THROW(cudaMemcpy(data(), host_data, num_elements * sizeof(T), cudaMemcpyHostToDevice));
++            const size_t n_bytes = num_elements * sizeof(T);
++            if (n_bytes == 0) {
++                return;
++            }
++
++            // Stage through pinned host memory instead of the default synchronous
++            // pageable-memory cudaMemcpy: allocate one cudaHostAlloc buffer sized to
++            // the whole transfer, fill it with a single host-side memcpy, then issue
++            // it to the device as a sequence of <=256 MiB cudaMemcpyAsync chunks on
++            // the CURRENT PyTorch CUDA stream (at::cuda::getCurrentCUDAStream(), as
++            // every other CUDA call in this file: ray_trace/unsigned_distance/
++            // signed_distance/sparse_marching_cubes). The legacy default stream (0)
++            // would implicitly synchronize with work queued on other streams, e.g. the
++            // texture sampling that runs concurrently with mesh preparation on another
++            // thread. Followed by ONE cudaStreamSynchronize on that same stream. This produces bit-identical device contents to the
++            // plain cudaMemcpy fallback below; it exists only to avoid the CUDA
++            // driver's slower pageable-memory H2D path (measured ~1.1 GB/s here) on
++            // large uploads (cuBVH triangles/nodes).
++            //
++            // The pinned buffer is owned by a local RAII guard (PinnedHostGuard) so it
++            // is freed exactly once on every exit path -- including an exception
++            // thrown mid-copy -- via a destructor that only ever calls cudaFreeHost
++            // and discards its result (a destructor must never throw: there is nothing
++            // actionable to do here with a free failure, and even a "sticky"/fatal CUDA
++            // error from an earlier failed call makes cudaFreeHost return an error
++            // code, not throw, so this remains safe to call unconditionally).
++            void* raw_pinned = nullptr;
++            cudaError_t alloc_err = cudaHostAlloc(&raw_pinned, n_bytes, cudaHostAllocPortable);
++            if (alloc_err != cudaSuccess) {
++                cudaGetLastError(); // clear the sticky error before falling back
++                CUDA_CHECK_THROW(cudaMemcpy(data(), host_data, n_bytes, cudaMemcpyHostToDevice));
++                return;
++            }
++
++            struct PinnedHostGuard {
++                void* ptr;
++                ~PinnedHostGuard() noexcept {
++                    if (ptr) {
++                        cudaFreeHost(ptr);
++                    }
++                }
++            } guard{raw_pinned};
++            uint8_t* pinned = (uint8_t*)raw_pinned;
++
++            std::memcpy(pinned, host_data, n_bytes);
++
++            cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++            constexpr size_t kChunkBytes = size_t{256} << 20; // 256 MiB
++            uint8_t* dst = (uint8_t*)data();
++            for (size_t offset = 0; offset < n_bytes; offset += kChunkBytes) {
++                const size_t this_chunk = std::min(kChunkBytes, n_bytes - offset);
++                CUDA_CHECK_THROW(cudaMemcpyAsync(dst + offset, pinned + offset, this_chunk, cudaMemcpyHostToDevice, stream));
++            }
++            CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
++            // `guard` frees the pinned buffer here on normal return, or while
++            // unwinding to the catch below if a CUDA_CHECK_THROW above threw.
+         } catch (std::runtime_error error) {
+             throw std::runtime_error(std::string("Could not copy from host: ") + error.what());
+         }

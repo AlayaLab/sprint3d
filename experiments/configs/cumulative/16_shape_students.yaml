@@ -1,0 +1,14 @@
+# Paper row: + shape students: consistency, 1 step each
+# Cumulative measurement, row 16 of 00-18 (file order = order of the measurement); block: distilled students
+# (rows 14-18).
+# The coarse- and fine-shape students, added in one step; the fine-shape adapter stays a separate low-rank
+# branch until row 17.
+name: shape_students
+method: fast
+block: distillation
+structure_adapter: structure
+adds: [coarse_shape_student, fine_shape_student]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, adaptive_remesh,
+  lean_glb_writer, gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers,
+  fa3_texture_flow, texture_kv_reuse, shared_conditioning, fa3_fine_shape_flow, texture_side_stream,
+  structure_student, texture_projection_reuse, coarse_shape_student, fine_shape_student]

@@ -1,0 +1,5 @@
+# Paper row: Ours
+# Same-step teacher comparison: the reference row, every lever on.
+name: ours
+method: fast
+levers: {}

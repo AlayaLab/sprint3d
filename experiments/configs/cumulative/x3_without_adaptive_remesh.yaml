@@ -1,0 +1,12 @@
+# Paper row: (control) + single-pass GPU chart segmentation, without the adaptive remesh
+# Cumulative measurement, control of row 08 (gpu_chart_segmentation); runs with the chain, not part of it.
+# Not a step of the chain. Row 08 without adaptive_remesh; row 08 minus this row is the effect of the
+# adaptive half-resolution remesh in the final mesh path, which the report measures separately from its
+# position in the chain (row 06).
+name: without_adaptive_remesh
+method: fast
+control_of: gpu_chart_segmentation
+adds: []
+removes: [adaptive_remesh]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, lean_glb_writer,
+  gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers]

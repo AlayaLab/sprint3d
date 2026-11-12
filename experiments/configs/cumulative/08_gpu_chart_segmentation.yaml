@@ -1,0 +1,14 @@
+# Paper row: + single-pass GPU chart segmentation
+# Cumulative measurement, row 08 of 00-18 (file order = order of the measurement); block: mesh
+# post-processing (rows 01-08).
+# From this row on the UV atlas is built in one pass on the GPU, so the 16-tile CPU unwrap of rows 01-07 no
+# longer runs. The two levers that act only on that unwrap (per_tile_single_thread_unwrap,
+# pinned_bvh_transfers) are switched on here as well, so that the last row is the deployed configuration;
+# they have nothing to act on (control x1_without_superseded_levers). End of the mesh post-processing block
+# (the report's 'mesh path rebuilt').
+name: gpu_chart_segmentation
+method: fast
+block: post_processing
+adds: [gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers]
+levers: [mesh_prep_worker_thread, fixed_bake_launch_config, fast_gpu_simplify, gpu_bvh_build, adaptive_remesh,
+  lean_glb_writer, gpu_chart_segmentation, per_tile_single_thread_unwrap, pinned_bvh_transfers]

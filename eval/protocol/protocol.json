@@ -1,0 +1,60 @@
+{
+ "name": "evaluation protocol of the normal-map tables",
+ "follows": "Pixal3D, arXiv 2605.10922, Sec. 4.1: single input image, normal maps in the input-camera frame, no ICP, angular metrics on the overlapping region",
+ "set": {
+  "list": "lists/validation_400.csv",
+  "objects": 400,
+  "views_per_object": 1,
+  "view": "column `view` of the list: one of the object's four conditioning renders, drawn once with a fixed seed (20260922); every method is evaluated on the same (object, view)",
+  "repeats": 1,
+  "aggregation": "per-view metrics averaged per object first, then over objects (objects weighted equally)"
+ },
+ "inputs": {
+  "conditioning_image": "renders_cond/<sha256>/<view:03d>.png (RGBA, 1024 px); the same render defines the ground-truth camera (transforms.json); how the renders were produced: docs/DATA.md",
+  "ground_truth_mesh": "mesh_dumps/<sha256>.pickle, in the world frame of the render"
+ },
+ "rows": {
+  "Pixal3D (official)": "the released Pixal3D run through its official inference.py at the defaults (1M faces, 4096^2 texture), condition `official`",
+  "Ours": "the accelerated pipeline at the same export (1M faces, 4096^2 texture; PNG texture where Pixal3D writes WebP), condition `official`",
+  "Ours, 200k export": "optional reference row, off by default: the accelerated pipeline at 200k faces / 2048^2 texture, condition `official`; an export setting this repository does not produce, printed only when its results are passed explicitly (make_table.py --extra-row)",
+  "condition official": "no ground-truth camera at inference: official alpha-bbox crop (1.1x), horizontal FoV estimated by MoGe-2 on the crop, distance = distance_from_fov, mesh_scale 1.0; the normal map is rendered with the product's own inference-time projection, mapped from the crop to the raw image by the exact NDC affine of the crop box",
+  "baselines": "rendered with the ground-truth camera pose after a fixed per-method frame map (frame_maps/baseline_frame_maps.json) and own-bbox normalisation; eval/make_table.py prints them as not reported, Tables 4 and 10 of the report give their values"
+ },
+ "table1": {
+  "columns": [
+   "IoU",
+   "PSNR",
+   "SSIM",
+   "LPIPS",
+   "Mean",
+   "Median",
+   "Mean_B",
+   "11.25",
+   "22.5",
+   "30",
+   "E2E (s)"
+  ],
+  "normal_maps": "flat (per-face) normals in camera space, flipped to face the camera, rgb = n * 0.5 + 0.5, 512^2",
+  "IoU": "mask IoU of prediction and ground truth, in %",
+  "PSNR / SSIM / LPIPS, main table": "overlap region (pixels covered by both): PSNR over the overlap pixels; SSIM (gaussian 11x11, sigma 1.5, K1 0.01, K2 0.03) map averaged over the overlap; LPIPS AlexNet v0.1 with both images 0.5-gray outside the overlap",
+  "PSNR / SSIM / LPIPS, appendix": "full 512^2 image, each map composited on a white background; LPIPS AlexNet v0.1 (VGG v0.1 stored as a secondary value)",
+  "Mean / Median": "angular error in degrees over the overlap",
+  "Mean_B": "angular error over overlap pixels within 10 px of the ground-truth mask boundary",
+  "11.25 / 22.5 / 30": "percentage of overlap pixels with angular error below the threshold",
+  "E2E": "median end-to-end seconds per input of the dedicated timing run (docs/TIMING.md); not an output of the evaluation, and measured on a different input subset (lists/timing_80.csv)",
+  "bold": "the better of Pixal3D (official) and Ours in each column",
+  "markers": "full-image variant of the table: * / dagger = significantly better / worse than Pixal3D (official), paired per-object sign test, Holm-adjusted over the 13 normal-map metrics (IoU, PSNR / SSIM / LPIPS in both regions, Mean, Median, Mean_B, three accuracies), p < 0.05"
+ },
+ "appendix_metrics": {
+  "geometry_3d": "Chamfer (non-squared L2, symmetric mean, 100k samples per side) and F-score at 0.005 / 0.01 / 0.02 after normalising every mesh by its own bounding box in ground-truth world axes; no registration",
+  "perception": "CLIP / CLIP-N (openai/clip-vit-large-patch14, 4 yaw views, white background), ULIP-2 and Uni3D image-3D consistency (coloured and geometry-only point clouds)",
+  "agreement_with_reference": "Chamfer / F-score to the reference product and DINOv2 ViT-L/14 distances (not used for the normal-map tables)"
+ },
+ "statistics": {
+  "ci": "per-object percentile bootstrap 95 % (10,000 resamples, seed 20260918)",
+  "test": "exact two-sided sign test on per-object differences, ties dropped",
+  "multiplicity": "Holm over the 13 normal-map metrics per compared row"
+ },
+ "precision": "exact float32 (TF32 disabled) for every render; the measured float32 matmul error is recorded",
+ "implementation": "eval/run_eval.py and eval/metrics/; conventions and their hash: metrics/conventions.py"
+}

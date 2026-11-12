@@ -1,0 +1,58 @@
+# Configuration of eval/run_eval.py.  Copy this file (e.g. to eval/config.yaml), set the paths, and pass it with
+# --config.  Relative paths are resolved against the directory of the configuration file; keys left out keep the
+# defaults shown here (metrics/config.py: DEFAULTS).
+
+dataset:
+  # Ground-truth root in the Pixal3D / TRELLIS data-toolkit layout (docs/DATA.md):
+  #   <root>/<source dir>/renders_cond/<sha256>/{<view:03d>.png, transforms.json}
+  #   <root>/<source dir>/mesh_dumps/<sha256>.pickle
+  #   <root>/<source dir>/ss_support_view_512/<sha256>/view<view:02d>{.npz,_scale.json}   (true_camera rows only)
+  root: /path/to/validation_ground_truth
+  # Object list: CSV with the columns id, sha256, source, licence, view (one view per object for the normal-map table),
+  # in_earlier_5k_training_set, gt_image_sha256, gt_mesh_dump_sha256 (docs/DATA.md).
+  list: lists/validation_400.csv
+  # Optional startup check: sha256 of the list file; the run stops when the file differs.  null disables the check.
+  list_sha256: 5d8c59524d45845aab9bd1929d8134332d682373844f73a79dc08bc98d681040
+  # `source` column of the list -> sub-directory of `root`.
+  source_dirs:
+    sketchfab: ObjaverseXL_sketchfab
+    abo: ABO
+    hssd: HSSD
+    3dfuture: 3D-FUTURE
+
+models:
+  # Destination directory of eval/fetch_metric_models.py.  When set, the entries below default to its layout:
+  #   hf_home=<dir>/hf  torch_home=<dir>/torch  ulip2_checkpoint=<dir>/ulip2/ULIP-2/pretrained_models/...pt
+  #   uni3d_checkpoint=<dir>/uni3d/modelzoo/uni3d-g/model.pt
+  #   dinov2_weights=<dir>/dinov2/dinov2_vitl14_pretrain.pth  ulip_code / uni3d_code / dinov2_code=<dir>/code/<name>
+  dir: /path/to/metric_models
+  # Hugging Face cache (CLIP ViT-L/14, OpenCLIP ViT-bigG-14, OpenCLIP EVA02-E-14-plus); exported as HF_HOME.
+  hf_home: null
+  # torch hub cache (torchvision AlexNet / VGG16 backbones of LPIPS); exported as TORCH_HOME.
+  torch_home: null
+  # true: HF_HUB_OFFLINE=1, i.e. only the pinned files already in the cache are used (no network access).
+  offline: true
+  # Checkouts of the official ULIP and Uni3D code (pinned commits) and their checkpoints (appendix perception metrics).
+  ulip_code: null
+  ulip2_checkpoint: null
+  uni3d_code: null
+  uni3d_checkpoint: null
+  # facebookresearch/dinov2 checkout and ViT-L/14 weights (agreement with a reference arm; skipped by default).
+  dinov2_code: null
+  dinov2_weights: null
+
+evaluation:
+  device: cuda
+  # Constant background of the full-image PSNR / SSIM / LPIPS (white | black | gray); part of the conventions hash.
+  background: white
+  # Region of PSNR / SSIM / LPIPS in tables/table1.md (overlap | full).  Presentation only: both are always stored.
+  table1_region: overlap
+  # Fixed per-method frame maps of external baselines (part of the conventions hash through its sha256).
+  frame_maps: frame_maps/baseline_frame_maps.json
+  # Base name of the reference arm (paired statistics and agreement metrics use <reference_arm>@<condition>).
+  reference_arm: pixal3d_official
+  # Metric groups to skip: 2d, 3d, perception, vs_reference, lpips, lpips_vgg, dino, clip, ulip2, uni3d.
+  # The normal-map table needs only 2d; the report's appendix used 2d, 3d and perception.
+  skip: [vs_reference]
+  # Bootstrap resamples of the paired statistics.
+  n_boot: 10000

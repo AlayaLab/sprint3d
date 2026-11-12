@@ -1,0 +1,9 @@
+# Paper row: + mesh pre-processing on a worker thread
+# Cumulative measurement, row 02 of 00-18 (file order = order of the measurement); block: mesh
+# post-processing (rows 01-08).
+# The host BVH is the OpenMP build that releases the GIL (native/legacy).
+name: mesh_prep_worker_thread
+method: fast
+block: post_processing
+adds: [mesh_prep_worker_thread]
+levers: [mesh_prep_worker_thread]
