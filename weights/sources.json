@@ -9,7 +9,7 @@
       "revision": "6c3864784f21a5da225ea2a78563f66f676228c5",
       "local_dir": "students",
       "role": "EMA LoRA of the four students (structure, coarse shape, fine shape, texture) and students.json",
-      "license": "CC BY-NC 4.0 (proposed)",
+      "license": "CC BY-NC 4.0",
       "files": [
         {
           "path": "students.json",

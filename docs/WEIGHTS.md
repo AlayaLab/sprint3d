@@ -59,7 +59,7 @@ cached, the copy that Pixal3D's own loader uses (branch `main`) is taken.
 
 | Source (`--only`) | Repository @ revision | Files | Size | License | Used for |
 |---|---|---:|---:|---|---|
-| `students` | [`AlayaLab/sprint3d`](https://huggingface.co/AlayaLab/sprint3d) @ `6c3864784f21` | 5 | 5.19 GB | CC BY-NC 4.0 (proposed) | EMA LoRA of the four students |
+| `students` | [`AlayaLab/sprint3d`](https://huggingface.co/AlayaLab/sprint3d) @ `6c3864784f21` | 5 | 5.19 GB | CC BY-NC 4.0 | EMA LoRA of the four students |
 | `pixal3d` | [`TencentARC/Pixal3D`](https://huggingface.co/TencentARC/Pixal3D) @ `0b31f9160aa4` | 17 | 24.04 GB | MIT (gated in the EU) | base flow models, decoders, `pipeline.json` |
 | `dinov3` | [`camenduru/dinov3-vitl16-pretrain-lvd1689m`](https://huggingface.co/camenduru/dinov3-vitl16-pretrain-lvd1689m) @ `3c276edd87d6` | 4 | 1.21 GB | DINOv3 License | image encoder for conditioning |
 | `moge2` | [`Ruicheng/moge-2-vitl`](https://huggingface.co/Ruicheng/moge-2-vitl) @ `39c4d5e957af` | 1 | 1.31 GB | MIT | camera field of view |
@@ -68,8 +68,8 @@ cached, the copy that Pixal3D's own loader uses (branch `main`) is taken.
 
 Full revisions are in `weights/sources.json`. Notes:
 
-- The student weights are proposed for release under CC BY-NC 4.0 (`LICENSES/CC-BY-NC-4.0.txt`), pending the lab's
-  open-source review. They were trained on renders of assets that include non-commercial and research-only licences:
+- The student weights are released under CC BY-NC 4.0 (`LICENSES/CC-BY-NC-4.0.txt`). They were trained on
+  renders of assets that include non-commercial and research-only licences:
   15.9 % of the 10k set (texture student) and 35.0 % of the 5k set (structure and shape students); see
   [DATA.md](DATA.md).
 - The DINOv3 repository is a mirror of `facebook/dinov3-vitl16-pretrain-lvd1689m`, the repository named
